@@ -1,0 +1,4 @@
+interface:
+  display_name: "Interview Review Coach"
+  short_description: "Interview recap and study coach"
+  default_prompt: "Use $interview-review-coach to review this interview transcript or recording into actual answers, suggested answers, and follow-up study priorities."
