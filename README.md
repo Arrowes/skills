@@ -97,7 +97,7 @@ bridge 在 Windows 上使用计划任务维持后台服务。每个 profile 的�
 计划任务：
 
 - `Codex-Lark-Shutdown-Reminder-0030`：触发三次提醒。
-- `Codex-Lark-Shutdown-Card-Actions`：每天 `00:29` 启动本地监听，每 15 秒检查一次按钮事件，到 `01:46` 结束；监听期间不调用模型。
+- `Codex-Lark-Shutdown-Card-Actions`：每天 `00:29` 启动本地监听，并在用户登录时补启动；每 15 秒检查一次按钮事件，到 `01:46` 结束。监听器只处理本次启动后的新点击，避免重放旧卡；监听期间不调用模型。
 
 按钮命令必须带当天日期，例如 `shutdown.skip.20260913` 和 `shutdown.now.20260913`。监听器还要校验目标私聊 ID、去重事件并忽略旧日期，防止旧卡片或重复点击执行动作。
 
