@@ -61,10 +61,13 @@ bridge 在 Windows 上使用计划任务维持后台服务。每个 profile 的�
 
 | 项目 | 当前行为 |
 | --- | --- |
+| 开机推送 | Windows 登录后启动 bridge；检测到 `codex` profile 写入 `profile-online` 后立即私聊推送一次。同一次 Windows 开机以系统启动时间去重，bridge 重启或启动脚本重复执行不会重复发送。发送失败最多重试 3 次。 |
 | 定时推送 | 每天 `00:00`，以及活动时段的 `10:00、12:00、14:00、16:00、18:00、20:00、22:00` 私聊推送。午休后的 `13:00` 延后到 `14:00`。 |
 | 低额度监控 | `10:05–23:50` 每 15 分钟检查；5 小时或 7 天额度首次低于 20% 时提醒一次，避免重复轰炸。 |
 | 数据来源 | `account/rateLimits/read`，读取 5 小时额度、7 天额度、重置次数、最近到期时间和额外额度。 |
 | 计划任务 | `CodexQuotaNotifier`、`CodexQuotaLowAlert`。 |
+
+开机推送复用 `~/.lark-channel/startup/start-codex-bridge.ps1`：脚本先等待本地代理并启动 bridge，再以当天 bridge 日志中的 `supervisor/profile-online` 作为真正上线信号，最后调用现有额度脚本。去重状态保存在 profile 的 launcher 日志目录，不新增常驻进程，也不触发模型会话。
 
 卡片使用 CardKit 2.0：
 
@@ -109,11 +112,11 @@ bridge 在 Windows 上使用计划任务维持后台服务。每个 profile 的�
 1. 安装最新版 @larksuite/cli、lark-channel-bridge，并使用 codex profile。
 2. 先检查 Node.js、Codex CLI、现有飞书应用和计划任务；不要覆盖可用配置。
 3. 通过当前 bridge/profile 获取实际用户与私聊标识，不要沿用旧机器的 ID。
-4. 创建额度提醒和关机提醒 PowerShell 脚本，并注册本章所列 Windows 计划任务。
+4. 创建额度提醒和关机提醒 PowerShell 脚本，并注册本章所列 Windows 计划任务；在 bridge 开机启动脚本中加入 `profile-online` 后仅发送一次额度卡的逻辑。
 5. 所有定时查询和消息发送必须绕过模型会话；关机按钮使用本地白名单 cmd，不使用 __bridge_cb。
 6. 不把 App Secret、token、用户 ID、chat ID 写入 Git 仓库或输出到对话。
 7. 先执行 PowerShell 语法检查、额度查询测试、禁用按钮的样例卡测试和关机动作 dry-run；测试期间不得真正关机。
-8. 最后核对任务触发时间、bridge 状态、私聊收件人和日志，并报告脚本路径及验证结果。
+8. 最后核对任务触发时间、bridge 状态、私聊收件人、开机去重状态和日志，并报告脚本路径及验证结果。
 ```
 
 迁移时还要在新机器上重新完成 PersonalAgent 绑定；Git 仓库只保存技术方案，不保存身份凭据。
