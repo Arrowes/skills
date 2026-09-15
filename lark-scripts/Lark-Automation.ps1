@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('Watch', 'Test')]
     [string]$Mode = 'Watch',
     [string]$ConfigPath = (Join-Path $HOME '.lark-channel\automation\config.json')
@@ -15,6 +15,7 @@ $logPath = Join-Path $runtimeDir 'automation.log'
 $quotaScript = Join-Path $PSScriptRoot 'Quota.ps1'
 $shutdownReminderScript = Join-Path $PSScriptRoot 'Shutdown-Reminder.ps1'
 $shutdownActionsScript = Join-Path $PSScriptRoot 'Shutdown-Actions.ps1'
+$script:lastAttemptByJob = @{}
 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
 
 function Write-AutomationLog([string]$Message) {
@@ -66,23 +67,32 @@ function Test-MonitorMinute([datetime]$Now) {
     return $minutes -ge $start -and $minutes -le $end -and (($minutes - $start) % 15 -eq 0)
 }
 
+function Test-CanAttempt([string]$Key, [int]$IntervalSeconds = 20) {
+    $now = Get-Date
+    if ($script:lastAttemptByJob.ContainsKey($Key) -and ($now - $script:lastAttemptByJob[$Key]).TotalSeconds -lt $IntervalSeconds) {
+        return $false
+    }
+    $script:lastAttemptByJob[$Key] = $now
+    return $true
+}
+
 function Invoke-DueWork($State, [datetime]$Now) {
     $minute = $Now.ToString('yyyyMMdd-HHmm')
     if ($State.minuteKeys -contains $minute) { return }
 
     $hhmm = $Now.ToString('HH:mm')
     $didWork = $false
-    if (@($config.quotaTimes) -contains $hhmm) {
+    if (@($config.quotaTimes) -contains $hhmm -and (Test-CanAttempt "$minute-quota")) {
         Invoke-Child $quotaScript @('-Mode', 'Send')
         Write-AutomationLog "OK scheduled quota $hhmm"
         $didWork = $true
     }
-    if (Test-MonitorMinute $Now) {
+    if ((Test-MonitorMinute $Now) -and (Test-CanAttempt "$minute-monitor")) {
         Invoke-Child $quotaScript @('-Mode', 'Monitor')
         Write-AutomationLog "OK quota monitor $hhmm"
         $didWork = $true
     }
-    if (@($config.shutdownTimes) -contains $hhmm) {
+    if (@($config.shutdownTimes) -contains $hhmm -and (Test-CanAttempt "$minute-shutdown")) {
         Invoke-Child $shutdownReminderScript @()
         Write-AutomationLog "OK shutdown reminder $hhmm"
         $didWork = $true
@@ -147,6 +157,7 @@ if ($Mode -eq 'Test') {
     $null = Get-BootKey
     Invoke-Child $quotaScript @('-Mode', 'Test')
     Invoke-Child $shutdownActionsScript @('-Mode', 'Test', '-Action', 'now')
+    Invoke-Child $shutdownReminderScript @('-Test', '-DryRun')
     Write-Output 'OK: configuration, quota card, scheduler, and shutdown dry-run validated.'
     exit 0
 }

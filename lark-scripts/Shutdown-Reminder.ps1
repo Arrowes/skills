@@ -1,5 +1,6 @@
 ﻿param(
     [switch]$Test,
+    [switch]$DryRun,
     [string]$ConfigPath = (Join-Path $HOME '.lark-channel\automation\config.json')
 )
 
@@ -9,7 +10,6 @@ $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $ConfigPath)) { throw "Config not found: $ConfigPath" }
 $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 $larkCli = [string]$config.larkCli
-$pwsh = [string]$config.pwsh
 $chatId = [string]$config.recipientChatId
 $runtimeDir = [string]$config.runtimeDir
 $statePath = Join-Path $runtimeDir 'shutdown-state.json'
@@ -53,23 +53,21 @@ function Test-BridgeReady {
 }
 
 function Send-Card([string]$CardJson, [string]$IdempotencyKey) {
-    $env:SHUTDOWN_REMINDER_CARD = $CardJson
-    try {
-        $command = "& '$larkCli' im +messages-send --as bot --chat-id '$chatId' --msg-type interactive --content `$env:SHUTDOWN_REMINDER_CARD --idempotency-key '$IdempotencyKey' --format json"
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-        $output = & $pwsh -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $encoded 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "lark-cli exited with code $LASTEXITCODE`: $($output -join ' ')" }
-        $result = ($output -join "`n") | ConvertFrom-Json
-        $messageId = [string]$result.data.message_id
-        [ordered]@{ messageId = $messageId; createdAt = (Get-Date).ToString('o'); cardJson = $CardJson } |
-            ConvertTo-Json -Compress |
-            Add-Content -LiteralPath $cardCachePath -Encoding utf8
-        Write-Log "OK card message_id=$messageId"
-        return $messageId
+    $arguments = @('im', '+messages-send', '--as', 'bot', '--chat-id', $chatId, '--msg-type', 'interactive', '--content', $CardJson, '--idempotency-key', $IdempotencyKey, '--format', 'json')
+    if ($DryRun) { $arguments += '--dry-run' }
+    $output = & $larkCli @arguments 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "lark-cli exited with code $LASTEXITCODE`: $($output -join ' ')" }
+    if ($DryRun) {
+        Write-Log 'OK card dry-run'
+        return $null
     }
-    finally {
-        Remove-Item Env:SHUTDOWN_REMINDER_CARD -ErrorAction SilentlyContinue
-    }
+    $result = ($output -join "`n") | ConvertFrom-Json
+    $messageId = [string]$result.data.message_id
+    [ordered]@{ messageId = $messageId; createdAt = (Get-Date).ToString('o'); cardJson = $CardJson } |
+        ConvertTo-Json -Compress |
+        Add-Content -LiteralPath $cardCachePath -Encoding utf8
+    Write-Log "OK card message_id=$messageId"
+    return $messageId
 }
 
 $now = Get-Date
