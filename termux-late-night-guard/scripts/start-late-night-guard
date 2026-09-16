@@ -1,0 +1,9 @@
+#!/data/data/com.termux/files/usr/bin/bash
+termux-wake-lock >/dev/null 2>&1 || true
+termux-api-start >/dev/null 2>&1 || true
+mkdir -p "$HOME/server/logs"
+
+if ! pgrep -f '[l]ate-night-guard.py daemon' >/dev/null; then
+  nohup python "$HOME/server/late-night-guard.py" daemon \
+    </dev/null >"$HOME/server/logs/late-night-guard.log" 2>&1 &
+fi

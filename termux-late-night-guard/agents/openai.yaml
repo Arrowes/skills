@@ -1,0 +1,4 @@
+interface:
+  display_name: "Termux Late Night Guard"
+  short_description: "Deploy and maintain a sensor-based bedtime alarm"
+  default_prompt: "Use $termux-late-night-guard to deploy or troubleshoot the light-based bedtime alarm on an Android Termux device."
