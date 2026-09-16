@@ -15,12 +15,15 @@
 | 文件 | 作用 |
 | --- | --- |
 | `Lark-Automation.ps1` | 唯一常驻协调器：等待 bridge、执行时间表、扫描一次卡片事件日志。 |
+| `Bridge-Startup.ps1` | Windows 登录时等待本机代理并启动 `codex` bridge，检测到已有实例时直接退出。 |
 | `Quota.ps1` | 按需读取 Codex 额度并生成或发送额度卡。 |
 | `Shutdown-Reminder.ps1` | 按需生成并发送关机卡。 |
 | `Shutdown-Actions.ps1` | 执行白名单关机操作并更新原卡按钮。 |
 | `Install.ps1` | 创建本机配置并注册 `S4U + Limited` 的隐藏任务。 |
 
 配置、状态、日志和任务备份保存在 `~/.lark-channel/automation/`，不会写入 Git。
+
+建议把整个仓库放在 `E:\Study\AI\skills`。可维护脚本集中在该目录；npm 安装的 bridge 程序保留在 npm 全局目录，身份配置与运行日志保留在 `~/.lark-channel`，避免将凭据提交到 Git。
 
 ## 当前行为
 
