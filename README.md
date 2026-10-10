@@ -9,6 +9,7 @@
 | [`lark-scripts/`](./lark-scripts/) | 飞书 CLI、Codex bridge、额度卡和关机卡的安装与自动化。 |
 | [`codex-scripts/`](./codex-scripts/) | Codex 本机运行辅助脚本，目前包含代理与网络守护。 |
 | [`interview-review-coach/`](./interview-review-coach/) | 技术面试录音、转录和笔记复盘 Skill。 |
+| [`body-fitness-coach/`](./body-fitness-coach/) | 本地私有数据健身教练：餐食记录、运动聚合、日报和周报。 |
 | [`termux-late-night-guard/`](./termux-late-night-guard/) | 用旧 Android 手机的传感器实现 Termux 熬夜检测、渐强警报和每周豁免额度。 |
 
 ## 外部 Skill 索引
