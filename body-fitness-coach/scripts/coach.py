@@ -28,6 +28,8 @@ from typing import Any, Iterator
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
+SKILL_ROOT = ROOT.parent
+DEFAULT_DATA_DIR = SKILL_ROOT / ".private"
 KEYRING_SERVICE = "body-coach"
 TOKEN_RE = re.compile(r"xj(?:llm|tpl|food|body)_[A-Za-z0-9_-]+")
 SEARCH_KEY_RE = re.compile(r"Bearer\s+([a-f0-9]{32,})")
@@ -37,8 +39,7 @@ def _default_data_dir() -> Path:
     configured = os.environ.get("BODY_FITNESS_DATA_DIR")
     if configured:
         return Path(configured).expanduser().resolve()
-    local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    return (local / "BodyFitnessCoach").resolve()
+    return DEFAULT_DATA_DIR.resolve()
 
 
 DATA_DIR = _default_data_dir()
@@ -52,11 +53,12 @@ def set_data_dir(path: Path) -> None:
 
 
 def load_config() -> dict[str, Any]:
+    bundled_mi = Path(sys.executable).with_name("mi-fitness-mcp.exe" if os.name == "nt" else "mi-fitness-mcp")
     defaults = {
         "chat_id": "",
         "lark_cli": str(Path.home() / "AppData/Roaming/npm/lark-cli.cmd"),
         "codex_cli": str(Path.home() / "AppData/Roaming/npm/codex.cmd"),
-        "mi_cli": "mi-fitness-mcp",
+        "mi_cli": str(bundled_mi) if bundled_mi.exists() else "mi-fitness-mcp",
         "timezone": "Asia/Shanghai",
         "model_analysis": True,
     }
@@ -64,6 +66,9 @@ def load_config() -> dict[str, Any]:
         row = conn.execute("select value from meta where key='config'").fetchone()
     if row:
         defaults.update(json.loads(row[0]))
+    configured_mi = Path(str(defaults["mi_cli"]))
+    if not configured_mi.exists() and configured_mi.name.lower() in {"mi-fitness-mcp", "mi-fitness-mcp.exe"} and bundled_mi.exists():
+        defaults["mi_cli"] = str(bundled_mi)
     return defaults
 
 
@@ -1400,7 +1405,12 @@ def doctor() -> int:
         mi_authenticated = bool(user_id and pass_token)
     except Exception:
         mi_authenticated = False
-    print(json.dumps({"commands": commands, "mi_authenticated": mi_authenticated, "secrets": secrets, "chat_id": bool(config.get("chat_id")), "model": model_diagnostic(config), "state": str(STATE_PATH)}, ensure_ascii=False, indent=2))
+    with db() as conn:
+        history = {
+            "meta": conn.execute("select count(*) from meta").fetchone()[0],
+            "writes": conn.execute("select count(*) from writes").fetchone()[0],
+        }
+    print(json.dumps({"commands": commands, "mi_authenticated": mi_authenticated, "secrets": secrets, "chat_id": bool(config.get("chat_id")), "model": model_diagnostic(config), "state": str(STATE_PATH), "history": history}, ensure_ascii=False, indent=2))
     return 0 if all(commands.values()) and all(secrets.values()) and mi_authenticated else 1
 
 
@@ -1423,6 +1433,8 @@ def self_check(data_dir: Path) -> int:
     with db() as conn:
         assert conn.execute("select 1").fetchone() == (1,)
     assert STATE_PATH == data_dir.resolve() / "private.db"
+    with patch.dict(os.environ, {"BODY_FITNESS_DATA_DIR": ""}):
+        assert _default_data_dir() == DEFAULT_DATA_DIR.resolve()
     assert "热身" not in today_recommendation(date(2026, 10, 10), "胸")
     print("self-check: private-db-path ok")
     original = DATA_DIR

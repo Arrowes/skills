@@ -1,6 +1,5 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [Parameter(Mandatory = $true)]
     [string]$DataDir,
     [string]$LegacyRoot,
     [string]$Profile = 'codex'
@@ -31,8 +30,13 @@ function Invoke-Checked([string]$Executable, [string[]]$Arguments) {
 $scriptPath = Resolve-FullPath $MyInvocation.MyCommand.Path
 $skillSource = Resolve-FullPath (Join-Path (Split-Path $scriptPath -Parent) '..')
 $coach = Resolve-FullPath (Join-Path $skillSource 'scripts\coach.py')
+$defaultData = Resolve-FullPath (Join-Path $skillSource '.private')
+if (-not $DataDir) {
+    $DataDir = $defaultData
+}
 $data = Resolve-FullPath $DataDir
 Assert-SafeDataDir $data
+$useDefaultData = $data.TrimEnd('\') -eq $defaultData.TrimEnd('\')
 
 $codexHome = if ($env:CODEX_HOME) { Resolve-FullPath $env:CODEX_HOME } else { Resolve-FullPath (Join-Path $env:USERPROFILE '.codex') }
 $skillsRoot = Join-Path $codexHome 'skills'
@@ -40,8 +44,13 @@ $skillTarget = Join-Path $skillsRoot 'body-fitness-coach'
 $venv = Join-Path $data '.venv'
 $python = Join-Path $venv 'Scripts\python.exe'
 $pythonw = Join-Path $venv 'Scripts\pythonw.exe'
-$dailyArguments = "`"$coach`" --data-dir `"$data`" daily"
-$mealArguments = "`"$coach`" --data-dir `"$data`" meal-reminder"
+$dataArgument = if ($useDefaultData) { '' } else { " --data-dir `"$data`"" }
+$dailyArguments = "`"$coach`"$dataArgument daily"
+$mealArguments = "`"$coach`"$dataArgument meal-reminder"
+$coachArguments = @($coach)
+if (-not $useDefaultData) {
+    $coachArguments += @('--data-dir', $data)
+}
 $legacy = $null
 $archive = $null
 if ($LegacyRoot) {
@@ -64,7 +73,7 @@ if (Test-Path -LiteralPath $skillTarget) {
 }
 
 if ($WhatIfPreference) {
-    [void]$PSCmdlet.ShouldProcess($data, 'Create private venv, install pinned dependency, migrate legacy state, and set BODY_FITNESS_DATA_DIR')
+    [void]$PSCmdlet.ShouldProcess($data, 'Create private venv, install pinned dependency, and migrate legacy state')
     if ($archive) {
         [void]$PSCmdlet.ShouldProcess($archive, "Archive $legacy excluding .venv, verify it, then migrate")
     }
@@ -119,13 +128,18 @@ if (-not (Test-Path -LiteralPath $skillTarget)) {
     New-Item -ItemType Junction -Path $skillTarget -Target $skillSource | Out-Null
 }
 
-[Environment]::SetEnvironmentVariable('BODY_FITNESS_DATA_DIR', $data, 'User')
+if ($useDefaultData) {
+    [Environment]::SetEnvironmentVariable('BODY_FITNESS_DATA_DIR', $null, 'User')
+    Remove-Item Env:BODY_FITNESS_DATA_DIR -ErrorAction SilentlyContinue
+} else {
+    [Environment]::SetEnvironmentVariable('BODY_FITNESS_DATA_DIR', $data, 'User')
+    $env:BODY_FITNESS_DATA_DIR = $data
+}
 [Environment]::SetEnvironmentVariable('LARK_CHANNEL_PROFILE', $Profile, 'User')
-$env:BODY_FITNESS_DATA_DIR = $data
 $env:LARK_CHANNEL_PROFILE = $Profile
 
-Invoke-Checked $python @($coach, '--data-dir', $data, 'self-check')
-Invoke-Checked $python @($coach, '--data-dir', $data, 'doctor')
+Invoke-Checked $python ($coachArguments + @('self-check'))
+Invoke-Checked $python ($coachArguments + @('doctor'))
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 $dailyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $dailyArguments
