@@ -153,17 +153,18 @@ Invoke-Checked $python ($coachArguments + @('self-check'))
 Invoke-Checked $python ($coachArguments + @('doctor'))
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
 $dailyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $dailyArguments
 $dailyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $dailyTrigger.Delay = 'PT3M'
-Register-ScheduledTask -TaskName 'BodyCoach-DailyReport' -Action $dailyAction -Trigger $dailyTrigger -Settings $settings -Description 'Send the daily private fitness report after logon' -Force | Out-Null
+Register-ScheduledTask -TaskName 'BodyCoach-DailyReport' -Action $dailyAction -Trigger $dailyTrigger -Settings $settings -Principal $principal -Description 'Send the daily private fitness report after logon' -Force | Out-Null
 
 $weeklyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $weeklyArguments
 $weeklyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '23:00'
-Register-ScheduledTask -TaskName 'BodyCoach-WeeklyReport' -Action $weeklyAction -Trigger $weeklyTrigger -Settings $settings -Description 'Send the weekly private fitness report on Sunday night' -Force | Out-Null
+Register-ScheduledTask -TaskName 'BodyCoach-WeeklyReport' -Action $weeklyAction -Trigger $weeklyTrigger -Settings $settings -Principal $principal -Description 'Send the weekly private fitness report on Sunday night' -Force | Out-Null
 
 $mealAction = New-ScheduledTaskAction -Execute $pythonw -Argument $mealArguments
 $mealTrigger = New-ScheduledTaskTrigger -Daily -At '23:30'
-Register-ScheduledTask -TaskName 'BodyCoach-MealReminder' -Action $mealAction -Trigger $mealTrigger -Settings $settings -Description 'Remind when a meal record is missing' -Force | Out-Null
+Register-ScheduledTask -TaskName 'BodyCoach-MealReminder' -Action $mealAction -Trigger $mealTrigger -Settings $settings -Principal $principal -Description 'Remind when a meal record is missing' -Force | Out-Null
 
 Write-Host "Installed body-fitness-coach with private data at $data"

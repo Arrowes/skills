@@ -49,6 +49,12 @@ KNOWLEDGE_PATH = KNOWLEDGE_DIR / "BODY_KNOWLEDGE.md"
 KNOWLEDGE_SOURCES_DIR = KNOWLEDGE_DIR / "sources"
 
 
+def run_process(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    if os.name == "nt":
+        kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+    return subprocess.run(*args, **kwargs)
+
+
 def set_data_dir(path: Path) -> None:
     global DATA_DIR, STATE_PATH, KNOWLEDGE_DIR, KNOWLEDGE_PATH, KNOWLEDGE_SOURCES_DIR
     DATA_DIR = path.expanduser().resolve()
@@ -228,7 +234,7 @@ def import_xunji_keys(chat_id: str, mappings: dict[str, str], start: str, inspec
         "--start", start, "--order", "asc", "--page-all", "--page-limit", "40",
         "--no-reactions", "--json",
     ]
-    result = subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8")
+    result = run_process(command, check=True, capture_output=True, text=True, encoding="utf-8")
     messages = find_messages(json.loads(result.stdout), set(mappings.values()))
     extracted: dict[str, str] = {}
     for name, message_id in mappings.items():
@@ -330,6 +336,10 @@ def report_card(
                 "margin": "0px 0px 4px 0px",
             }
         )
+    weekly_overview = [(label, parsed[label]) for label in ("活动", "恢复", "营养") if label in parsed]
+    if weekly_overview:
+        content = "**本周概览**\n" + "\n".join(f"{label}：{value}" for label, value in weekly_overview)
+        elements.append({"tag": "column_set", "flex_mode": "none", "columns": [{"tag": "column", "width": "weighted", "weight": 1, "background_style": "grey-50", "padding": "8px", "elements": [{"tag": "markdown", "content": content}]}], "margin": "0px 0px 4px 0px"})
     diet = [(label, parsed[label]) for label in ("饮食热量", "蛋白质", "碳水", "脂肪") if label in parsed]
     if diet:
         columns = [
@@ -348,7 +358,15 @@ def report_card(
             for label, value in diet
         ]
         elements.append({"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "4px", "columns": columns, "margin": "0px 0px 4px 0px"})
-    shown_labels = {"活动热量", "步数", "距离", "睡眠", "静息心率", "心率区间", "身体变化", "身体分析", "训练", "昨日运动", "昨日完成", "今日训练", "今日安排", "饮食热量", "蛋白质", "碳水", "脂肪", "教练建议", "教练分析"}
+    next_week, template_decision = parsed.get("下周训练"), parsed.get("模板判断") or parsed.get("模板建议")
+    if next_week or template_decision:
+        content = "**下周执行方案**"
+        if next_week:
+            content += f"\n{next_week}"
+        if template_decision:
+            content += f"\n<font color='grey'>模板：{template_decision}</font>"
+        elements.append({"tag": "column_set", "flex_mode": "none", "columns": [{"tag": "column", "width": "weighted", "weight": 1, "background_style": "green-50", "padding": "8px", "elements": [{"tag": "markdown", "content": content}]}], "margin": "0px 0px 4px 0px"})
+    shown_labels = {"周期", "活动", "恢复", "营养", "活动热量", "步数", "距离", "睡眠", "静息心率", "心率区间", "身体变化", "身体分析", "训练", "昨日运动", "昨日完成", "今日训练", "今日安排", "饮食热量", "蛋白质", "碳水", "脂肪", "下周训练", "模板判断", "模板建议", "教练建议", "教练分析"}
     remaining = [line for line in lines if line.split("：", 1)[0] not in shown_labels]
     advice = parsed.get("教练建议") or parsed.get("教练分析")
     if advice:
@@ -499,6 +517,37 @@ def training_plan_brief(plan: dict[str, Any], include_warmup: bool = True) -> st
     if plan.get("cardio"):
         parts.append("练后有氧：" + str(plan["cardio"]))
     return "；".join(parts)
+
+
+def next_week_training_plan(split: str) -> str:
+    selected = split if split in SPLIT_ORDER else SPLIT_ORDER[0]
+    plan = strength_template_plan(selected)
+    following = SPLIT_ORDER[(SPLIT_ORDER.index(selected) + 1) % len(SPLIT_ORDER)]
+    items = "、".join(plan["items"])
+    return (
+        f"目标2–3次：首个可训练日完成{plan['name']}部滚动训练（{items}，{plan['intensity']}）；"
+        f"完成并记录后，下次独立力量轮到{'背' if following == '背加臂' else following}。"
+        "周四胸背课可选；周末游泳与BODY PUMP二选一，至少保留1个完整休息日"
+    )
+
+
+def weekly_template_context(split: str) -> str:
+    selected = split if split in SPLIT_ORDER else SPLIT_ORDER[0]
+    return f"当前{selected}模板：" + "、".join(stable_training_templates()[selected])
+
+
+def split_weekly_advice(value: str, split: str) -> tuple[str, str]:
+    selected = split if split in SPLIT_ORDER else SPLIT_ORDER[0]
+    marker = re.search(r"模板(?:判断|建议)：", value)
+    if marker:
+        analysis = value[:marker.start()].strip(" ；")
+        decision = value[marker.end():].strip(" ；")
+        if decision:
+            if decision.startswith("保持当前模板"):
+                decision = decision.replace("保持当前模板", f"保持当前{selected}模板", 1)
+            return analysis, decision
+    fallback = f"保持当前{selected}模板；本周缺少连续负荷、完成次数和RPE证据，先按下周计划执行并完整记录后再判断"
+    return value, fallback
 
 
 @contextmanager
@@ -833,7 +882,7 @@ def sync_knowledge_document(create: bool = False, force: bool = False) -> dict[s
                 "+create", "--as", "user", "--title", "个人身体知识库", "--content", "@./" + KNOWLEDGE_PATH.name,
                 "--doc-format", "markdown", "--parent-position", "my_library",
             ]
-            completed = subprocess.run(command, cwd=KNOWLEDGE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+            completed = run_process(command, cwd=KNOWLEDGE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "document creation failed")
             response = json.loads(completed.stdout)
@@ -848,7 +897,7 @@ def sync_knowledge_document(create: bool = False, force: bool = False) -> dict[s
                 "+update", "--as", "user", "--doc", document, "--command", "overwrite", "--content", "@./" + KNOWLEDGE_PATH.name,
                 "--doc-format", "markdown", "--revision-id", "-1",
             ]
-            completed = subprocess.run(command, cwd=KNOWLEDGE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+            completed = run_process(command, cwd=KNOWLEDGE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "document update failed")
             response = json.loads(completed.stdout)
@@ -1008,7 +1057,7 @@ def mi_snapshot(config: dict[str, Any], days: int = 7, end: date | None = None) 
     env["PYTHONIOENCODING"] = "utf-8"
     end = end or date.today()
     start = end - timedelta(days=days)
-    sync = subprocess.run([config["mi_cli"], "sync", "--start-date", start.isoformat(), "--end-date", end.isoformat()], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, env=env)
+    sync = run_process([config["mi_cli"], "sync", "--start-date", start.isoformat(), "--end-date", end.isoformat()], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, env=env)
     try:
         data = asyncio.run(_mi_query(config, start, end))
         return {"status": "ok" if sync.returncode == 0 else "partial", "data": data}
@@ -1019,7 +1068,7 @@ def mi_snapshot(config: dict[str, Any], days: int = 7, end: date | None = None) 
 def xunji_snapshot(day: date, weekly: bool = False) -> dict[str, Any]:
     # Keep enough history to recover the latest non-zero nutrition target when
     # Xunji returns zero limits for a day that has standalone food records.
-    start = day - timedelta(days=6)
+    start = day - timedelta(days=13 if weekly else 6)
     result: dict[str, Any] = {}
     calls = [
         (
@@ -1041,7 +1090,7 @@ def xunji_snapshot(day: date, weekly: bool = False) -> dict[str, Any]:
         except Exception as exc:
             result[name] = {"error": str(exc)}
     training = []
-    for offset in range(7 if weekly else 2):
+    for offset in range(14 if weekly else 2):
         target = day - timedelta(days=offset)
         try:
             training.append(
@@ -1570,45 +1619,76 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recomm
 
 def weekly_summary(mi: dict[str, Any], xunji: dict[str, Any], start: date, end: date) -> list[str]:
     overviews = [mi_cache_overview(start + timedelta(days=offset)) for offset in range(7)]
+    previous_overviews = [mi_cache_overview(start - timedelta(days=7) + timedelta(days=offset)) for offset in range(7)]
 
-    def numbers(section: str, field: str) -> list[float]:
-        return [float(value) for overview in overviews if isinstance(value := overview.get(section, {}).get(field), (int, float))]
+    def numbers(source: list[dict[str, Any]], section: str, field: str) -> list[float]:
+        return [float(value) for overview in source if isinstance(value := overview.get(section, {}).get(field), (int, float))]
 
-    steps = numbers("activity", "steps")
-    active_kcal = numbers("activity", "active_kcal")
-    distance = numbers("activity", "distance_m")
+    def trend(current: list[float], previous: list[float], unit: str = "", digits: int = 0) -> str:
+        if len(current) < 4 or len(previous) < 4:
+            return ""
+        delta = sum(current) / len(current) - sum(previous) / len(previous)
+        threshold = 0.05 if digits else 0.5
+        if abs(delta) < threshold:
+            return "，较上周持平"
+        direction = "增加" if delta > 0 else "减少"
+        return f"，较上周{direction}{abs(delta):.{digits}f}{unit}"
+
+    steps = numbers(overviews, "activity", "steps")
+    active_kcal = numbers(overviews, "activity", "active_kcal")
+    distance = numbers(overviews, "activity", "distance_m")
+    previous_steps = numbers(previous_overviews, "activity", "steps")
     sleep = [
         float(value)
         for overview in overviews
         if isinstance(value := overview.get("sleep", {}).get("time_asleep_minutes") or overview.get("sleep", {}).get("duration_minutes"), (int, float))
     ]
-    resting = numbers("heart", "resting_bpm")
+    previous_sleep = [
+        float(value)
+        for overview in previous_overviews
+        if isinstance(value := overview.get("sleep", {}).get("time_asleep_minutes") or overview.get("sleep", {}).get("duration_minutes"), (int, float))
+    ]
+    resting = numbers(overviews, "heart", "resting_bpm")
+    previous_resting = numbers(previous_overviews, "heart", "resting_bpm")
     workouts = [
         workout
         for workout in mi.get("data", {}).get("query_workouts", {}).get("data", {}).get("workouts", [])
         if isinstance(workout, dict) and (record_day := _record_date(workout.get("start_at"))) and start <= record_day <= end
     ]
+    previous_workouts = [
+        workout
+        for workout in mi.get("data", {}).get("query_workouts", {}).get("data", {}).get("workouts", [])
+        if isinstance(workout, dict) and (record_day := _record_date(workout.get("start_at"))) and start - timedelta(days=7) <= record_day < start
+    ]
     workout_minutes = sum(float(workout.get("duration_minutes", 0) or 0) for workout in workouts if isinstance(workout.get("duration_minutes"), (int, float)))
     training_days = xunji.get("training", []) if isinstance(xunji.get("training"), list) else []
-    xunji_sessions = sum(len(_day_trains(day)) for day in training_days)
+    xunji_sessions = sum(len(_day_trains(day)) for day in training_days[:7])
+    previous_xunji_sessions = sum(len(_day_trains(day)) for day in training_days[7:14])
     diet = xunji.get("diet", {})
     diet_days = [xunji_diet_day(diet, start + timedelta(days=offset)) for offset in range(7)]
+    previous_diet_days = [xunji_diet_day(diet, start - timedelta(days=7) + timedelta(days=offset)) for offset in range(7)]
     diet_totals = [
         totals
         for day in diet_days
         if isinstance(totals := day.get("totals"), dict)
         and any(isinstance(totals.get(field), (int, float)) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
     ]
+    previous_diet_totals = [
+        totals
+        for day in previous_diet_days
+        if isinstance(totals := day.get("totals"), dict)
+        and any(isinstance(totals.get(field), (int, float)) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
+    ]
 
-    def diet_average(field: str) -> float | None:
-        values = [float(total[field]) for total in diet_totals if isinstance(total.get(field), (int, float))]
+    def diet_average(source: list[dict[str, Any]], field: str) -> float | None:
+        values = [float(total[field]) for total in source if isinstance(total.get(field), (int, float))]
         return sum(values) / len(values) if values else None
 
     lines = []
     if steps or active_kcal or distance:
         parts = [f"活动记录{max(len(steps), len(active_kcal), len(distance))}天"]
         if steps:
-            parts.append(f"日均步数{sum(steps) / len(steps):.0f}")
+            parts.append(f"日均步数{sum(steps) / len(steps):.0f}{trend(steps, previous_steps, '步')}")
         if active_kcal:
             parts.append(f"活动热量合计{sum(active_kcal):.0f}kcal")
         if distance:
@@ -1616,17 +1696,30 @@ def weekly_summary(mi: dict[str, Any], xunji: dict[str, Any], start: date, end: 
         lines.append("活动：" + "，".join(parts))
     recovery = []
     if sleep:
-        recovery.append(f"{len(sleep)}天平均睡眠{sum(sleep) / len(sleep) / 60:.1f}小时")
+        recovery.append(f"{len(sleep)}天平均睡眠{sum(sleep) / len(sleep) / 60:.1f}小时{trend([value / 60 for value in sleep], [value / 60 for value in previous_sleep], '小时', 1)}")
     if resting:
-        recovery.append(f"{len(resting)}天平均静息心率{sum(resting) / len(resting):.0f}bpm")
+        recovery.append(f"{len(resting)}天平均静息心率{sum(resting) / len(resting):.0f}bpm{trend(resting, previous_resting, 'bpm')}")
     if recovery:
         lines.append("恢复：" + "；".join(recovery))
-    lines.append(f"训练：小米记录{len(workouts)}次/{workout_minutes:.0f}分钟，训记记录{xunji_sessions}项")
-    calories, protein, carbs, fat = (diet_average(field) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
+    workout_comparison = ""
+    if mi.get("status") == "ok":
+        delta = len(workouts) - len(previous_workouts)
+        workout_comparison = "，小米较上周次数持平" if delta == 0 else f"，小米较上周{'增加' if delta > 0 else '减少'}{abs(delta)}次"
+    if len(training_days) >= 14 and not _has_error(training_days):
+        delta = xunji_sessions - previous_xunji_sessions
+        workout_comparison += "，训记较上周项数持平" if delta == 0 else f"，训记较上周{'增加' if delta > 0 else '减少'}{abs(delta)}项"
+    lines.append(f"训练：小米记录{len(workouts)}次/{workout_minutes:.0f}分钟，训记记录{xunji_sessions}项{workout_comparison}")
+    calories, protein, carbs, fat = (diet_average(diet_totals, field) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
+    previous_nutrition = {
+        field: diet_average(previous_diet_totals, field)
+        for field in ("totalCal", "totalProtein", "totalCarb", "totalFat")
+    }
     nutrition = []
-    for label, value, unit in (("热量", calories, "kcal"), ("蛋白质", protein, "g"), ("碳水", carbs, "g"), ("脂肪", fat, "g")):
+    for label, field, value, unit in (("热量", "totalCal", calories, "kcal"), ("蛋白质", "totalProtein", protein, "g"), ("碳水", "totalCarb", carbs, "g"), ("脂肪", "totalFat", fat, "g")):
         if value is not None:
-            nutrition.append(f"日均{label}{value:.0f}{unit}")
+            previous = previous_nutrition[field]
+            comparison = trend([value] * len(diet_totals), [previous] * len(previous_diet_totals), unit) if previous is not None else ""
+            nutrition.append(f"日均{label}{value:.0f}{unit}{comparison}")
     lines.append("营养：" + (f"记录{len(diet_totals)}天，" + "，".join(nutrition) if nutrition else "暂无有效记录"))
     if mi.get("status") != "ok":
         lines.append(f"数据状态：小米{mi.get('status', 'unknown')}")
@@ -1639,9 +1732,12 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
     payload = {"summary": context or [], "weekly": weekly}
     if weekly:
         format_rule = (
-            "结合一周趋势，用恢复、训练、营养三个标签各写1至2句，总计不超过360个汉字；"
-            "不用Markdown标题或列表。指出主要变化、下周行动和依据，"
-            "避免重复罗列原始数据。最多提出一项模板调整，必须写明理由并标注待用户确认，不得表述为已修改。"
+            "结合本周事实和可用环比，用恢复、训练、营养三个标签各写1至2句，最后必须再写模板判断，总计不超过360个汉字；"
+            "不用Markdown标题或列表。解释最重要变化、风险或缺口及依据，不要把原始数据换个说法重复。"
+            "下周训练安排已由程序给出，不得用泛泛的‘按计划推进’替代分析。"
+            "最后严格二选一：证据不足时写‘模板判断：保持当前模板；理由…’；"
+            "只有连续训练证据明确支持时，才写‘模板建议：把“原动作或组次”改为“新动作或组次”；理由…；待确认’，"
+            "不得表述为已修改，也不得省略具体差异。"
         )
     else:
         format_rule = (
@@ -1660,7 +1756,7 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
 
 
 DAILY_FALLBACK_ADVICE = "按今日模板量力训练；优先补足睡眠、蛋白质和饮水，疲劳明显则减量或休息。"
-WEEKLY_FALLBACK_ADVICE = "恢复：关注睡眠与疲劳趋势；训练：按完成度逐步加量；营养：围绕训练日补足蛋白质、碳水和饮水。"
+WEEKLY_FALLBACK_ADVICE = "恢复：按本周睡眠与静息心率继续观察，异常不只看单日。训练：执行卡片中的2–3次具体安排并记录重量、次数和RPE。营养：至少记录6天，再按目标检查蛋白质与总热量。模板判断：保持当前模板；缺少连续负荷与完成度证据。"
 
 
 def command_available(value: str | None) -> bool:
@@ -1721,7 +1817,7 @@ def model_advice(config: dict[str, Any], mi: dict[str, Any], xunji: dict[str, An
             "--skip-git-repo-check", "--ignore-rules", "-C", str(ROOT), "-o", str(output), "-",
         ]
         try:
-            completed = subprocess.run(command, input=prompt, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=120)
+            completed = run_process(command, input=prompt, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=120)
             if completed.returncode == 0 and output.exists():
                 answer = output.read_text(encoding="utf-8").strip()
                 if answer:
@@ -1739,11 +1835,11 @@ def send_report(config: dict[str, Any], title: str, lines: list[str], identity: 
     ensure_lark_channel_env()
     card = json.dumps(report_card(title, lines, daily_progress=progress, subtitle=subtitle), ensure_ascii=False, separators=(",", ":"))
     base = command_prefix(config["lark_cli"]) + ["im", "+messages-send", "--as", "bot", "--chat-id", config["chat_id"], "--idempotency-key", identity]
-    sent = subprocess.run(base + ["--msg-type", "interactive", "--content", card], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    sent = run_process(base + ["--msg-type", "interactive", "--content", card], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if sent.returncode == 0:
         return True
     text = title + "\n" + "\n".join(f"- {line}" for line in lines)
-    fallback = subprocess.run(base + ["--text", text], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    fallback = run_process(base + ["--text", text], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     return fallback.returncode == 0
 
 
@@ -1802,15 +1898,23 @@ def run_weekly(dry_run: bool = False) -> int:
     last = date.fromisoformat(last_raw) if last_raw else None
     for period_end in pending_week_ends(last, latest_end):
         period_start = period_end - timedelta(days=6)
-        mi = mi_snapshot(config, 6, period_end)
+        mi = mi_snapshot(config, 13, period_end)
         xunji = xunji_snapshot(period_end, weekly=True)
         title = f"健身周报 · {period_start.month}月{period_start.day}日—{period_end.month}月{period_end.day}日"
         facts = weekly_summary(mi, xunji, period_start, period_end)
+        next_split = meta_get("next_strength_template")
+        next_split = next_split if next_split in SPLIT_ORDER else SPLIT_ORDER[0]
+        next_plan = next_week_training_plan(next_split)
+        context = [*facts, "下周训练：" + next_plan, weekly_template_context(next_split)]
+        analysis, template_decision = split_weekly_advice(
+            model_advice(config, mi, xunji, weekly=True, context=context), next_split
+        )
         lines = [
             f"周期：{period_start.isoformat()} 至 {period_end.isoformat()}",
             *facts,
-            "模板更新：周报仅提出建议；展示具体差异并经你确认后才会修改",
-            "教练分析：" + model_advice(config, mi, xunji, weekly=True, context=facts),
+            "下周训练：" + next_plan,
+            "模板判断：" + template_decision,
+            "教练分析：" + analysis,
         ]
         if dry_run:
             preview_report(title, lines)
@@ -1872,7 +1976,7 @@ def doctor() -> int:
     commands = {name: bool(shutil.which(value) or Path(value).exists()) for name, value in (("mi", config["mi_cli"]), ("lark", config["lark_cli"]), ("codex", config["codex_cli"]))}
     if commands["mi"]:
         try:
-            commands["mi"] = subprocess.run([config["mi_cli"], "--help"], capture_output=True, timeout=15).returncode == 0
+            commands["mi"] = run_process([config["mi_cli"], "--help"], capture_output=True, timeout=15).returncode == 0
         except (OSError, subprocess.SubprocessError):
             commands["mi"] = False
     secrets = {name: bool(secret_get(name)) for name in ("xunji_train_key", "xunji_diet_key", "xunji_food_search_key", "xunji_body_key", "xunji_template_key")}
@@ -1909,6 +2013,11 @@ def plan_preview() -> str:
 def self_check(data_dir: Path) -> int:
     """Run the one portable runtime check shipped with the coach."""
     set_data_dir(data_dir)
+    with patch.object(subprocess, "run") as process_run:
+        run_process(["self-check"])
+        expected = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        assert process_run.call_args.kwargs.get("creationflags", 0) == expected
+    print("self-check: subprocess-window ok")
     with db() as conn:
         assert conn.execute("select 1").fetchone() == (1,)
     assert STATE_PATH == data_dir.resolve() / "private.db"
@@ -2015,9 +2124,15 @@ def self_check(data_dir: Path) -> int:
     fake_diet = {"res": {"days": [{"date": "2026-10-05", "totals": {"totalCal": 2000, "totalProtein": 150, "totalCarb": 220, "totalFat": 60}}]}}
     with patch(__name__ + ".mi_cache_overview", return_value=fake_week):
         week = weekly_summary(fake_mi, {"training": [], "diet": fake_diet}, date(2026, 10, 5), date(2026, 10, 11))
-    assert "活动：活动记录7天，日均步数8000，活动热量合计2800kcal，距离合计42.0km" in week
-    assert "训练：小米记录1次/60分钟，训记记录0项" in week
+    assert "活动：活动记录7天，日均步数8000，较上周持平，活动热量合计2800kcal，距离合计42.0km" in week
+    assert "训练：小米记录1次/60分钟，训记记录0项，小米较上周增加1次" in week
     assert "营养：记录1天，日均热量2000kcal，日均蛋白质150g，日均碳水220g，日均脂肪60g" in week
+    plan = next_week_training_plan("腿")
+    assert "倒蹬3×10–12" in plan and "周末游泳与BODY PUMP二选一" in plan and "轮到肩" in plan
+    analysis, decision = split_weekly_advice("恢复：稳定。模板判断：保持当前模板；证据不足。", "腿")
+    assert analysis == "恢复：稳定。" and decision.startswith("保持当前腿模板")
+    weekly_card = report_card("健身周报", ["下周训练：" + plan, "模板判断：" + decision, "教练分析：恢复：稳定。"])
+    assert any("下周执行方案" in json.dumps(element, ensure_ascii=False) for element in weekly_card["body"]["elements"])
     print("self-check: report-period-and-prompt ok")
     assert model_diagnostic({"model_analysis": False, "codex_cli": "missing"})["reason"] == "disabled"
     assert model_diagnostic({"model_analysis": True, "codex_cli": "missing"})["reason"] == "missing_cli"
@@ -2060,6 +2175,7 @@ def self_check(data_dir: Path) -> int:
         patch(__name__ + ".mi_cache_overview", return_value=fake_cache),
         patch(__name__ + ".mi_body_history", return_value=[]),
         patch(__name__ + ".post_json", return_value={"res": {"days": []}}),
+        patch(__name__ + ".meta_get", return_value=None),
         patch(__name__ + ".send_report", side_effect=AssertionError("dry-run sent a message")),
         patch(__name__ + ".sync_mi_workouts", side_effect=AssertionError("dry-run wrote a workout")),
         patch(__name__ + ".meta_set", side_effect=AssertionError("dry-run changed state")),
@@ -2068,7 +2184,7 @@ def self_check(data_dir: Path) -> int:
         assert run_weekly(dry_run=True) == 0
         assert run_meal_reminder(dry_run=True) == 0
         assert mi_mock.call_args_list[0].args[1] == 1
-        assert mi_mock.call_args_list[1].args[1] == 6
+        assert mi_mock.call_args_list[1].args[1] == 13
     print("self-check: report-dry-run ok")
     return 0
 
