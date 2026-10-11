@@ -24,4 +24,6 @@ The strength split advances only after a recorded standalone strength session. F
 
 Daily reports show body change only when a new measurement arrives; do not repeat the same measurement. Daily coaching must weigh all available body change, sleep, activity, completed training, and diet data together, then use one or two short sentences for the highest-priority action without mechanically repeating report data or adding a mental-wellbeing section. Weekly coaching may be more detailed and should separate recovery, training, and nutrition trends. It is not medical diagnosis. Persistent pain, swelling, numbness, weakness, chest symptoms, fainting, or disordered-eating signs require professional evaluation rather than training escalation.
 
+When a scheduled weekly report was missed while the computer was unavailable, the next weekly run sends every unsent completed week oldest-first and saves progress after each successful card. A first run sends only the latest completed week.
+
 Run `.private/.venv/Scripts/python.exe scripts/coach.py --help` for commands. Run `doctor` for history location, missing credentials, CLI availability, Xiaomi login, or model fallback causes. Install or migrate with `powershell -File scripts/install.ps1`; preview consequential changes with `-WhatIf` first.

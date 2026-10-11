@@ -96,6 +96,17 @@ def weekly_period(today: date) -> tuple[date, date]:
     return end - timedelta(days=6), end
 
 
+def pending_week_ends(last_sent: date | None, latest: date) -> list[date]:
+    if last_sent is None:
+        return [latest]
+    current = last_sent + timedelta(days=7)
+    result = []
+    while current <= latest:
+        result.append(current)
+        current += timedelta(days=7)
+    return result
+
+
 def diet_auto_allowed(food: dict[str, Any]) -> bool:
     if food.get("analyze_only"):
         return False
@@ -239,6 +250,7 @@ def report_card(
     lines: list[str],
     template: str = "blue",
     daily_progress: list[dict[str, Any]] | None = None,
+    subtitle: str | None = None,
 ) -> dict[str, Any]:
     parsed = {line.split("：", 1)[0]: line.split("：", 1)[1] for line in lines if "：" in line}
     elements: list[dict[str, Any]] = []
@@ -352,15 +364,17 @@ def report_card(
         )
     if not elements:
         elements.append({"tag": "markdown", "content": "\n".join(f"- {line}" for line in lines)})
+    header: dict[str, Any] = {
+        "title": {"tag": "plain_text", "content": title},
+        "template": template,
+        "icon": {"tag": "standard_icon", "token": "calendar_colorful"},
+    }
+    if subtitle:
+        header["subtitle"] = {"tag": "plain_text", "content": subtitle}
     return {
         "schema": "2.0",
         "config": {"width_mode": "default", "summary": {"content": title}},
-        "header": {
-            "title": {"tag": "plain_text", "content": title},
-            "subtitle": {"tag": "plain_text", "content": date.today().isoformat()},
-            "template": template,
-            "icon": {"tag": "standard_icon", "token": "calendar_colorful"},
-        },
+        "header": header,
         "body": {"direction": "vertical", "padding": "8px 12px 8px 12px", "vertical_spacing": "4px", "elements": elements},
     }
 
@@ -1181,10 +1195,76 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recomm
     return lines
 
 
+def weekly_summary(mi: dict[str, Any], xunji: dict[str, Any], start: date, end: date) -> list[str]:
+    overviews = [mi_cache_overview(start + timedelta(days=offset)) for offset in range(7)]
+
+    def numbers(section: str, field: str) -> list[float]:
+        return [float(value) for overview in overviews if isinstance(value := overview.get(section, {}).get(field), (int, float))]
+
+    steps = numbers("activity", "steps")
+    active_kcal = numbers("activity", "active_kcal")
+    distance = numbers("activity", "distance_m")
+    sleep = [
+        float(value)
+        for overview in overviews
+        if isinstance(value := overview.get("sleep", {}).get("time_asleep_minutes") or overview.get("sleep", {}).get("duration_minutes"), (int, float))
+    ]
+    resting = numbers("heart", "resting_bpm")
+    workouts = [
+        workout
+        for workout in mi.get("data", {}).get("query_workouts", {}).get("data", {}).get("workouts", [])
+        if isinstance(workout, dict) and (record_day := _record_date(workout.get("start_at"))) and start <= record_day <= end
+    ]
+    workout_minutes = sum(float(workout.get("duration_minutes", 0) or 0) for workout in workouts if isinstance(workout.get("duration_minutes"), (int, float)))
+    training_days = xunji.get("training", []) if isinstance(xunji.get("training"), list) else []
+    xunji_sessions = sum(len(_day_trains(day)) for day in training_days)
+    diet = xunji.get("diet", {})
+    diet_days = [xunji_diet_day(diet, start + timedelta(days=offset)) for offset in range(7)]
+    diet_totals = [
+        totals
+        for day in diet_days
+        if isinstance(totals := day.get("totals"), dict)
+        and any(isinstance(totals.get(field), (int, float)) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
+    ]
+
+    def diet_average(field: str) -> float | None:
+        values = [float(total[field]) for total in diet_totals if isinstance(total.get(field), (int, float))]
+        return sum(values) / len(values) if values else None
+
+    lines = []
+    if steps or active_kcal or distance:
+        parts = [f"活动记录{max(len(steps), len(active_kcal), len(distance))}天"]
+        if steps:
+            parts.append(f"日均步数{sum(steps) / len(steps):.0f}")
+        if active_kcal:
+            parts.append(f"活动热量合计{sum(active_kcal):.0f}kcal")
+        if distance:
+            parts.append(f"距离合计{sum(distance) / 1000:.1f}km")
+        lines.append("活动：" + "，".join(parts))
+    recovery = []
+    if sleep:
+        recovery.append(f"{len(sleep)}天平均睡眠{sum(sleep) / len(sleep) / 60:.1f}小时")
+    if resting:
+        recovery.append(f"{len(resting)}天平均静息心率{sum(resting) / len(resting):.0f}bpm")
+    if recovery:
+        lines.append("恢复：" + "；".join(recovery))
+    lines.append(f"训练：小米记录{len(workouts)}次/{workout_minutes:.0f}分钟，训记记录{xunji_sessions}项")
+    calories, protein, carbs, fat = (diet_average(field) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
+    nutrition = []
+    for label, value, unit in (("热量", calories, "kcal"), ("蛋白质", protein, "g"), ("碳水", carbs, "g"), ("脂肪", fat, "g")):
+        if value is not None:
+            nutrition.append(f"日均{label}{value:.0f}{unit}")
+    lines.append("营养：" + (f"记录{len(diet_totals)}天，" + "，".join(nutrition) if nutrition else "暂无有效记录"))
+    if mi.get("status") != "ok":
+        lines.append(f"数据状态：小米{mi.get('status', 'unknown')}")
+    if _has_error(xunji):
+        lines.append("数据状态：训记部分读取异常")
+    return lines
+
+
 def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = False, context: list[str] | None = None) -> str:
     payload = {"summary": context or [], "weekly": weekly}
     if weekly:
-        payload.update({"mi": compact_data(mi), "xunji": compact_data(xunji)})
         format_rule = (
             "结合一周趋势，用恢复、训练、营养三个标签各写1至2句，总计不超过360个汉字；"
             "不用Markdown标题或列表。指出主要变化、下周行动和依据，"
@@ -1282,9 +1362,9 @@ def model_advice(config: dict[str, Any], mi: dict[str, Any], xunji: dict[str, An
     return "模型分析暂不可用（运行 doctor 查看原因）；" + fallback
 
 
-def send_report(config: dict[str, Any], title: str, lines: list[str], identity: str, progress: list[dict[str, Any]] | None = None) -> bool:
+def send_report(config: dict[str, Any], title: str, lines: list[str], identity: str, progress: list[dict[str, Any]] | None = None, subtitle: str | None = None) -> bool:
     ensure_lark_channel_env()
-    card = json.dumps(report_card(title, lines, daily_progress=progress), ensure_ascii=False, separators=(",", ":"))
+    card = json.dumps(report_card(title, lines, daily_progress=progress, subtitle=subtitle), ensure_ascii=False, separators=(",", ":"))
     base = command_prefix(config["lark_cli"]) + ["im", "+messages-send", "--as", "bot", "--chat-id", config["chat_id"], "--idempotency-key", identity]
     sent = subprocess.run(base + ["--msg-type", "interactive", "--content", card], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if sent.returncode == 0:
@@ -1306,7 +1386,7 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     if last == today and not force:
         return 0
     missed = missing_dates(last, today)
-    mi = mi_snapshot(config)
+    mi = mi_snapshot(config, 1)
     xunji = xunji_snapshot(today)
     split_state = rolling_split_state(xunji, today, meta_get("next_strength_template"), meta_get("last_split_training_date"))
     sync_status = "dry_run" if dry_run else "none"
@@ -1344,24 +1424,28 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
 def run_weekly(dry_run: bool = False) -> int:
     config = load_config()
     today = date.today()
-    period_start, period_end = weekly_period(today)
-    if not dry_run and meta_get("last_weekly") == period_end.isoformat():
-        return 0
-    mi = mi_snapshot(config, 14, period_end)
-    xunji = xunji_snapshot(period_end, weekly=True)
-    title = f"健身周报 · {period_start.month}月{period_start.day}日—{period_end.month}月{period_end.day}日"
-    lines = [
-        f"周期：{period_start.isoformat()} 至 {period_end.isoformat()}",
-        "训练、睡眠、步数与饮食按趋势判断，不评价单日波动",
-        "模板更新：周报仅提出建议；展示具体差异并经你确认后才会修改",
-        "教练分析：" + model_advice(config, mi, xunji, weekly=True),
-    ]
-    if dry_run:
-        preview_report(title, lines)
-        return 0
-    if not send_report(config, title, lines, request_id("weekly", period_end.isoformat(), lines)):
-        return 2
-    meta_set("last_weekly", period_end.isoformat())
+    _, latest_end = weekly_period(today)
+    last_raw = meta_get("last_weekly")
+    last = date.fromisoformat(last_raw) if last_raw else None
+    for period_end in pending_week_ends(last, latest_end):
+        period_start = period_end - timedelta(days=6)
+        mi = mi_snapshot(config, 6, period_end)
+        xunji = xunji_snapshot(period_end, weekly=True)
+        title = f"健身周报 · {period_start.month}月{period_start.day}日—{period_end.month}月{period_end.day}日"
+        facts = weekly_summary(mi, xunji, period_start, period_end)
+        lines = [
+            f"周期：{period_start.isoformat()} 至 {period_end.isoformat()}",
+            *facts,
+            "模板更新：周报仅提出建议；展示具体差异并经你确认后才会修改",
+            "教练分析：" + model_advice(config, mi, xunji, weekly=True, context=facts),
+        ]
+        if dry_run:
+            preview_report(title, lines)
+            continue
+        subtitle = f"{period_start.isoformat()} — {period_end.isoformat()}"
+        if not send_report(config, title, lines, request_id("weekly", period_end.isoformat(), lines), subtitle=subtitle):
+            return 2
+        meta_set("last_weekly", period_end.isoformat())
     return 0
 
 
@@ -1383,7 +1467,7 @@ def run_meal_reminder(dry_run: bool = False) -> int:
     if dry_run:
         preview_report("三餐记录提醒", lines)
         return 0
-    return 0 if send_report(config, "三餐记录提醒", lines, request_id("meal", today.isoformat(), missing)) else 2
+    return 0 if send_report(config, "三餐记录提醒", lines, request_id("meal", today.isoformat(), missing), subtitle=today.isoformat()) else 2
 
 
 def write_food(path: Path, source_id: str) -> int:
@@ -1499,10 +1583,26 @@ def self_check(data_dir: Path) -> int:
     print("self-check: onboarding-and-bridge-env ok")
     assert weekly_period(date(2026, 10, 11)) == (date(2026, 10, 5), date(2026, 10, 11))
     assert weekly_period(date(2026, 10, 12)) == (date(2026, 10, 5), date(2026, 10, 11))
+    assert pending_week_ends(None, date(2026, 10, 11)) == [date(2026, 10, 11)]
+    assert pending_week_ends(date(2026, 9, 27), date(2026, 10, 11)) == [date(2026, 10, 4), date(2026, 10, 11)]
+    assert "subtitle" not in report_card("健身日报 · 10月11日", [])["header"]
     daily_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["已校验汇总"])
     weekly_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, weekly=True, context=["趋势汇总"])
     assert '"mi"' not in daily_prompt and '"xunji"' not in daily_prompt
-    assert '"mi"' in weekly_prompt and '"xunji"' in weekly_prompt
+    assert '"mi"' not in weekly_prompt and '"xunji"' not in weekly_prompt
+    fake_week = {
+        "activity": {"steps": 8000, "active_kcal": 400, "distance_m": 6000},
+        "sleep": {"time_asleep_minutes": 450},
+        "heart": {"resting_bpm": 60},
+        "body": {},
+    }
+    fake_mi = {"status": "ok", "data": {"query_workouts": {"data": {"workouts": [{"start_at": "2026-10-06T18:00:00+08:00", "duration_minutes": 60}]}}}}
+    fake_diet = {"res": {"days": [{"date": "2026-10-05", "totals": {"totalCal": 2000, "totalProtein": 150, "totalCarb": 220, "totalFat": 60}}]}}
+    with patch(__name__ + ".mi_cache_overview", return_value=fake_week):
+        week = weekly_summary(fake_mi, {"training": [], "diet": fake_diet}, date(2026, 10, 5), date(2026, 10, 11))
+    assert "活动：活动记录7天，日均步数8000，活动热量合计2800kcal，距离合计42.0km" in week
+    assert "训练：小米记录1次/60分钟，训记记录0项" in week
+    assert "营养：记录1天，日均热量2000kcal，日均蛋白质150g，日均碳水220g，日均脂肪60g" in week
     print("self-check: report-period-and-prompt ok")
     assert model_diagnostic({"model_analysis": False, "codex_cli": "missing"})["reason"] == "disabled"
     assert model_diagnostic({"model_analysis": True, "codex_cli": "missing"})["reason"] == "missing_cli"
@@ -1540,7 +1640,7 @@ def self_check(data_dir: Path) -> int:
     fake_config = {"model_analysis": False, "codex_cli": "missing", "chat_id": "chat-test", "lark_cli": "lark-cli"}
     with (
         patch(__name__ + ".load_config", return_value=fake_config),
-        patch(__name__ + ".mi_snapshot", return_value={}),
+        patch(__name__ + ".mi_snapshot", return_value={}) as mi_mock,
         patch(__name__ + ".xunji_snapshot", return_value=fake_xunji),
         patch(__name__ + ".mi_cache_overview", return_value=fake_cache),
         patch(__name__ + ".mi_body_history", return_value=[]),
@@ -1552,6 +1652,8 @@ def self_check(data_dir: Path) -> int:
         assert run_daily(force=True, dry_run=True) == 0
         assert run_weekly(dry_run=True) == 0
         assert run_meal_reminder(dry_run=True) == 0
+        assert mi_mock.call_args_list[0].args[1] == 1
+        assert mi_mock.call_args_list[1].args[1] == 6
     print("self-check: report-dry-run ok")
     return 0
 

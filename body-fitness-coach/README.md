@@ -61,7 +61,7 @@ powershell -File .\scripts\install.ps1 -WhatIf
 安装器默认使用当前 Skill 的 `.private/`，并注册：
 
 - `BodyCoach-DailyReport`：登录后生成日报。
-- `BodyCoach-WeeklyReport`：每周日 23:00 生成周报；关机错过后在下次开机时补发。
+- `BodyCoach-WeeklyReport`：每周日 23:00 生成周报；关机错过后在下次登录时按周从旧到新补发，每张成功后保存进度。
 - `BodyCoach-MealReminder`：每天 23:30 检查缺失餐食。
 
 任务直接运行 `.private/.venv/Scripts/pythonw.exe`，不依赖聊天会话，也不弹 PowerShell 窗口。
@@ -95,7 +95,7 @@ $coach = '.\scripts\coach.py'
 - 日报仅将已校验汇总交给模型；周报保留最近一周趋势数据。
 - 身体变化仅在出现新测量时展示。
 - 热身动作保留在训练模板或训记中，不重复塞入日报。
-- 周报可以详细分析恢复、训练和营养趋势。
+- 周报先在本地聚合 7 天活动、恢复、训练和营养事实，再把精简摘要交给模型分析。
 - 训练滚动顺序只在完成独立力量训练后推进。
 - 所有建议只作健身与生活方式参考，不替代医疗诊断。
 
