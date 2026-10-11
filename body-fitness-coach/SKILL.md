@@ -16,6 +16,8 @@ When explicitly activated in a fresh or reset session, run `doctor` once. Confir
 | Analyze data or preview a report | Use `daily --dry-run`, `weekly --dry-run`, or `doctor`; these may read sources but must not send or write externally. |
 | Send a daily/weekly report | Ask for confirmation immediately before running without `--dry-run`; use `daily --force` only for an explicitly requested resend. |
 | Record food from text/photo | For a text breakfast/lunch/dinner log, extract meal type, food, amount, unit, date, and nutrition estimate, then write it immediately without asking for confirmation. For photos, show uncertain recognition for confirmation. Then pass JSON through `food --json-file ... --source-id ...`. |
+| Record personal body knowledge | When the user provides a report, measurement, body image, supplement, available equipment, medical history, symptom, or any other durable fact useful for future body/training advice, record it locally without asking for a second confirmation. Follow the knowledge workflow below. |
+| View or use personal body knowledge | Use `knowledge status`, `knowledge search`, or `knowledge show`. Retrieve only the relevant entries for the current task. |
 | Change a training template | Show the concrete diff and obtain separate confirmation. Reports may recommend changes but never apply them. |
 
 Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, `unit`, `date`, and `ntr`. Do not invent missing portions. Text meal logs are pre-authorized for immediate recording; state any ordinary serving-size or nutrition estimates in the completion message instead of pausing for confirmation. Photos with ambiguous foods or quantities require user confirmation.
@@ -23,6 +25,25 @@ Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, 
 The strength split advances only after a recorded standalone strength session. Fixed activities, missed sessions, and report generation do not advance it.
 
 Daily reports show body change only when a new measurement arrives; do not repeat the same measurement. Daily coaching must weigh all available body change, sleep, activity, completed training, and diet data together, then use one or two short sentences for the highest-priority action without mechanically repeating report data or adding a mental-wellbeing section. Weekly coaching may be more detailed and should separate recovery, training, and nutrition trends. It is not medical diagnosis. Persistent pain, swelling, numbness, weakness, chest symptoms, fainting, or disordered-eating signs require professional evaluation rather than training escalation.
+
+## Personal body knowledge workflow
+
+The private knowledge base is `.private/knowledge/BODY_KNOWLEDGE.md`. Original PDFs, images, and other files are deduplicated by SHA-256 under `.private/knowledge/sources/`; searchable metadata and normalized metrics stay in the existing `.private/private.db`. `.private/` is gitignored. Never copy personal source material into tracked files.
+
+Do not use a fixed category list. For every new item:
+
+1. Decide whether it is a durable fact that may change future health, recovery, nutrition, equipment, or training advice. Ordinary meals, workouts, Xiaomi data, and Xunji data remain in their existing systems and are not duplicated here.
+2. Run `knowledge status`, then `knowledge search --query <specific topic>` for comparable history. Reuse an existing primary category when its decision purpose matches; otherwise create one concise new category. Add multiple tags as needed, but only one primary category.
+3. Extract and clearly separate source facts, comparison with similar history, analysis, and uncertain or unverified items. Never present an inference as a source fact. Normalize comparable numeric metrics and include their unit, reference range, abnormal flag, and source page when available.
+4. For a multi-page PDF, use the PDF skill to inspect every page. Work in batches of roughly 5–10 pages when needed, retain the original file, record total page count and processed pages, and do not store full OCR text in the Markdown. The original PDF remains the source of truth.
+5. Write one JSON payload and run `knowledge add --json-file ... --source-id ... --source <original-file>`. Use the bridge message ID as `source-id` when available. The command deduplicates originals, adds exact-name/unit metric comparisons, regenerates the readable document, and attempts a Lark mirror sync.
+6. Give the user a concise comparison and analysis after recording. For medical material, explain uncertainty and recommend professional review when appropriate; do not diagnose.
+
+Knowledge JSON fields are: required `record_date`, `title`, and `category`; optional `tags`, `facts`, `comparison`, `analysis`, `uncertainty`, `metrics`, `current`, `page_count`, `pages_processed`, and `source_files`. `current` is a key/value map for facts that should appear in the current snapshot; a newer entry with the same key replaces it, and an empty value removes it. A metric is `{name,value,unit,reference_range,abnormal,page}`.
+
+Daily reports, weekly reports, meal reminders, and their model prompts must never read the knowledge tables or `BODY_KNOWLEDGE.md`. Only retrieve targeted knowledge when the user's task actually needs it. `knowledge show` is for an explicit full review; normally prefer a narrow `knowledge search` to reduce token use.
+
+The local Markdown is the primary readable record. Its Lark document is a one-way mirror: a local write succeeds even if Lark is unavailable, failed sync is marked pending, and the next knowledge operation retries once a document is configured. Raw source files are not uploaded. Create or configure the mirror with `knowledge sync --create` or `knowledge sync --doc <url-or-token>`. Never start Lark OAuth from a group chat; ask the user to authorize in a private chat if user identity is unavailable.
 
 When a scheduled weekly report was missed while the computer was unavailable, the next weekly run sends every unsent completed week oldest-first and saves progress after each successful card. A first run sends only the latest completed week.
 

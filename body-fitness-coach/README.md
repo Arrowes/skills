@@ -14,6 +14,9 @@ body-fitness-coach/
 │  └─ install.ps1
 └─ .private/                 # 仅本机存在，整体被 Git 忽略
    ├─ private.db             # 历史记录和运行状态
+   ├─ knowledge/
+   │  ├─ BODY_KNOWLEDGE.md  # 可读的个人身体知识库
+   │  └─ sources/           # 按内容哈希去重的原始报告、图片和附件
    └─ .venv/                 # Python 运行环境
 ```
 
@@ -79,6 +82,8 @@ $coach = '.\scripts\coach.py'
 & $python $coach daily --dry-run
 & $python $coach weekly --dry-run
 & $python $coach meal-reminder --dry-run
+& $python $coach knowledge status
+& $python $coach knowledge search --query '血脂'
 ```
 
 其他命令可通过以下方式查看：
@@ -88,6 +93,22 @@ $coach = '.\scripts\coach.py'
 ```
 
 真实补发日报需要再次确认后使用 `daily --force`。训练模板修改必须先展示差异并单独确认。
+
+## 个人身体知识库
+
+体检报告、医院报告、体测、身体照片、补剂、器材条件等长期有用的信息记录在一个可读文档中；分类按实际内容动态产生，不预建空目录。原件存于 `sources/`，同一文件只保留一份；结构化指标、来源哈希和检索索引复用 `private.db`。
+
+新增资料前先检索同类历史，写入时区分原始事实、历史对比、分析和不确定项。多页 PDF 可分 5–10 页处理，但必须记录总页数和已覆盖页，原 PDF 始终是最终依据。Markdown 只保留关键事实与结论，不保存全文 OCR，也不重复小米、训记的日常数据。
+
+飞书文档是本地 Markdown 的单向镜像：本地写入优先，远端失败会保留待同步状态；原 PDF 和图片默认不上传。首次创建或绑定：
+
+```powershell
+& $python $coach knowledge sync --create
+# 或绑定已有文档
+& $python $coach knowledge sync --doc '<飞书文档链接>'
+```
+
+日报、周报和三餐提醒不会读取知识库；只有训练计划、补剂评估、报告解读、伤病适配等确实相关的任务才做定向检索。
 
 ## 报告规则
 
@@ -101,7 +122,7 @@ $coach = '.\scripts\coach.py'
 
 ## 隐私与发布
 
-`private.db` 可包含聊天目标、身体指标、饮食、训练、同步缓存和报告状态。访问令牌及密码保存在 Windows Credential Manager。
+`private.db` 和 `knowledge/` 可包含聊天目标、身体指标、饮食、训练、报告原件、同步缓存和报告状态。访问令牌及密码保存在 Windows Credential Manager。
 
 以下内容不得进入 Git：
 

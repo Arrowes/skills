@@ -44,12 +44,18 @@ def _default_data_dir() -> Path:
 
 DATA_DIR = _default_data_dir()
 STATE_PATH = DATA_DIR / "private.db"
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+KNOWLEDGE_PATH = KNOWLEDGE_DIR / "BODY_KNOWLEDGE.md"
+KNOWLEDGE_SOURCES_DIR = KNOWLEDGE_DIR / "sources"
 
 
 def set_data_dir(path: Path) -> None:
-    global DATA_DIR, STATE_PATH
+    global DATA_DIR, STATE_PATH, KNOWLEDGE_DIR, KNOWLEDGE_PATH, KNOWLEDGE_SOURCES_DIR
     DATA_DIR = path.expanduser().resolve()
     STATE_PATH = DATA_DIR / "private.db"
+    KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+    KNOWLEDGE_PATH = KNOWLEDGE_DIR / "BODY_KNOWLEDGE.md"
+    KNOWLEDGE_SOURCES_DIR = KNOWLEDGE_DIR / "sources"
 
 
 def load_config() -> dict[str, Any]:
@@ -502,6 +508,29 @@ def db() -> Iterator[sqlite3.Connection]:
     try:
         conn.execute("create table if not exists meta (key text primary key, value text not null)")
         conn.execute("create table if not exists writes (request_id text primary key, status text not null, response text)")
+        conn.execute(
+            """create table if not exists knowledge_entries (
+                id text primary key, record_date text not null, category text not null,
+                title text not null, tags_json text not null, body_json text not null,
+                source_hashes_json text not null, created_at text not null
+            )"""
+        )
+        conn.execute(
+            """create table if not exists knowledge_metrics (
+                entry_id text not null, name text not null, value real, value_text text,
+                unit text not null, reference_range text, abnormal text, page integer,
+                primary key(entry_id, name, unit),
+                foreign key(entry_id) references knowledge_entries(id)
+            )"""
+        )
+        conn.execute(
+            """create table if not exists knowledge_sources (
+                sha256 text primary key, stored_name text not null, original_name text not null,
+                size_bytes integer not null, added_at text not null
+            )"""
+        )
+        conn.execute("create index if not exists knowledge_entries_category_date on knowledge_entries(category, record_date desc)")
+        conn.execute("create index if not exists knowledge_metrics_name on knowledge_metrics(name, unit)")
         conn.commit()
         with conn:
             yield conn
@@ -555,6 +584,340 @@ def meta_get(key: str) -> str | None:
 def meta_set(key: str, value: str) -> None:
     with db() as conn:
         conn.execute("insert into meta(key,value) values(?,?) on conflict(key) do update set value=excluded.value", (key, value))
+
+
+def _json_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _text_list(value: Any) -> list[str]:
+    return [str(item).strip() for item in _json_list(value) if str(item).strip()]
+
+
+def _safe_source_name(name: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "-", Path(name).name).strip("-.")
+    return cleaned[:100] or "source"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _store_knowledge_source(path: Path, record_date: str) -> dict[str, Any]:
+    source = path.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"knowledge source not found: {source}")
+    digest = _file_sha256(source)
+    with db() as conn:
+        existing = conn.execute(
+            "select stored_name,original_name,size_bytes from knowledge_sources where sha256=?", (digest,)
+        ).fetchone()
+    if existing:
+        return {"sha256": digest, "stored_name": existing[0], "original_name": existing[1], "size_bytes": existing[2]}
+    KNOWLEDGE_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{record_date}-{digest[:10]}-{_safe_source_name(source.name)}"
+    destination = KNOWLEDGE_SOURCES_DIR / stored_name
+    shutil.copy2(source, destination)
+    with db() as conn:
+        conn.execute(
+            "insert or ignore into knowledge_sources(sha256,stored_name,original_name,size_bytes,added_at) values(?,?,?,?,?)",
+            (digest, stored_name, source.name, source.stat().st_size, datetime.now().astimezone().isoformat(timespec="seconds")),
+        )
+    return {"sha256": digest, "stored_name": stored_name, "original_name": source.name, "size_bytes": source.stat().st_size}
+
+
+def _metric_value(metric: dict[str, Any]) -> tuple[float | None, str]:
+    raw = metric.get("value")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw), str(raw)
+    text = str(raw or "").strip()
+    try:
+        return float(text), text
+    except ValueError:
+        return None, text
+
+
+def _automatic_metric_comparisons(conn: sqlite3.Connection, metrics: list[dict[str, Any]]) -> list[str]:
+    comparisons: list[str] = []
+    for metric in metrics:
+        name, unit = str(metric.get("name", "")).strip(), str(metric.get("unit", "")).strip()
+        value, _ = _metric_value(metric)
+        if not name or value is None:
+            continue
+        prior = conn.execute(
+            """select m.value,e.record_date from knowledge_metrics m
+               join knowledge_entries e on e.id=m.entry_id
+               where lower(m.name)=lower(?) and m.unit=? and m.value is not null
+               order by e.record_date desc,e.created_at desc limit 1""",
+            (name, unit),
+        ).fetchone()
+        if prior:
+            delta = value - float(prior[0])
+            sign = "+" if delta > 0 else ""
+            suffix = f" {unit}" if unit else ""
+            comparisons.append(f"{name}：{prior[0]:g} → {value:g}{suffix}（{sign}{delta:g}，上次 {prior[1]}）")
+    return comparisons
+
+
+def _markdown_cell(value: Any) -> str:
+    return _markdown_text(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _markdown_text(value: Any) -> str:
+    text = str("—" if value is None or value == "" else value).replace("\\", "\\\\").replace("\n", " ")
+    for character in ("`", "*", "_", "[", "]", "$", "~", "<"):
+        text = text.replace(character, "\\" + character)
+    return text
+
+
+def render_knowledge_document() -> Path:
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    with db() as conn:
+        rows = conn.execute(
+            "select id,record_date,category,title,tags_json,body_json,source_hashes_json,created_at "
+            "from knowledge_entries order by record_date desc,created_at desc"
+        ).fetchall()
+        categories = conn.execute(
+            "select category,count(*),max(record_date) from knowledge_entries group by category order by max(record_date) desc"
+        ).fetchall()
+        source_lookup = {
+            row[0]: {"stored_name": row[1], "original_name": row[2]}
+            for row in conn.execute("select sha256,stored_name,original_name from knowledge_sources")
+        }
+        metric_rows = conn.execute(
+            "select entry_id,name,value,value_text,unit,reference_range,abnormal,page from knowledge_metrics"
+        ).fetchall()
+    metrics_by_entry: dict[str, list[tuple[Any, ...]]] = {}
+    for metric in metric_rows:
+        metrics_by_entry.setdefault(metric[0], []).append(metric[1:])
+    current: dict[str, str] = {}
+    for row in reversed(rows):
+        body = json.loads(row[5])
+        if isinstance(body.get("current"), dict):
+            for key, value in body["current"].items():
+                if value in (None, ""):
+                    current.pop(str(key), None)
+                else:
+                    current[str(key)] = str(value)
+    lines = [
+        "# 个人身体知识库",
+        "",
+        "> 本文档由 Body Fitness Coach 维护。本地版本是主记录；飞书文档是便于查看的单向镜像。原始报告和图片仅保存在本机。",
+        "",
+        "## 当前概况",
+        "",
+    ]
+    if current:
+        lines.extend(f"- **{_markdown_text(key)}**：{_markdown_text(value)}" for key, value in current.items())
+    else:
+        lines.append("- 暂无已确认的当前状态；历史记录仍保留在下方。")
+    lines.extend(["", "## 分类索引", ""])
+    if categories:
+        lines.extend(f"- **{_markdown_text(category)}**：{count} 条，最近更新 {latest}" for category, count, latest in categories)
+    else:
+        lines.append("- 暂无记录；分类会根据实际资料动态创建。")
+    lines.extend(["", "## 历史记录", ""])
+    if not rows:
+        lines.append("暂无记录。")
+    for entry_id, record_date, category, title, tags_json, body_json, source_hashes_json, _ in rows:
+        tags, body, source_hashes = json.loads(tags_json), json.loads(body_json), json.loads(source_hashes_json)
+        lines.extend([f"### {record_date}｜{_markdown_text(category)}｜{_markdown_text(title)}", ""])
+        if tags:
+            lines.extend(["**标签**：" + "、".join(_markdown_text(item) for item in tags), ""])
+        sections = (
+            ("本次事实", "facts"),
+            ("与历史对比", "comparison"),
+            ("分析", "analysis"),
+            ("不确定项与待复核", "uncertainty"),
+        )
+        for heading, key in sections:
+            values = _text_list(body.get(key))
+            if values:
+                lines.extend([f"#### {heading}", "", *[f"- {_markdown_text(value)}" for value in values], ""])
+        metrics = metrics_by_entry.get(entry_id, [])
+        if metrics:
+            lines.extend(["#### 结构化指标", "", "| 指标 | 结果 | 单位 | 参考范围 | 标记 | 页码 |", "| --- | ---: | --- | --- | --- | ---: |"])
+            for name, value, value_text, unit, reference_range, abnormal, page in metrics:
+                shown = f"{value:g}" if value is not None else value_text
+                lines.append("| " + " | ".join(_markdown_cell(item) for item in (name, shown, unit, reference_range, abnormal, page)) + " |")
+            lines.append("")
+        if source_hashes:
+            labels = [source_lookup[item]["original_name"] for item in source_hashes if item in source_lookup]
+            coverage = body.get("pages_processed")
+            page_count = body.get("page_count")
+            detail = "、".join(labels) or "本地原件"
+            if page_count:
+                detail += f"；共 {page_count} 页"
+            if coverage:
+                detail += "；已处理页：" + ",".join(str(item) for item in coverage)
+            lines.extend([f"**本地来源**：{_markdown_text(detail)}", ""])
+        lines.extend([f"<!-- entry:{entry_id} -->", "", "---", ""])
+    KNOWLEDGE_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return KNOWLEDGE_PATH
+
+
+def knowledge_search(query: str = "", category: str = "", limit: int = 10) -> list[dict[str, Any]]:
+    clauses, parameters = [], []
+    if category:
+        clauses.append("category=?")
+        parameters.append(category)
+    if query:
+        clauses.append("(title like ? or category like ? or tags_json like ? or body_json like ? or id in (select entry_id from knowledge_metrics where name like ? or value_text like ?))")
+        pattern = f"%{query}%"
+        parameters.extend([pattern] * 6)
+    where = " where " + " and ".join(clauses) if clauses else ""
+    with db() as conn:
+        rows = conn.execute(
+            "select id,record_date,category,title,tags_json,body_json from knowledge_entries" + where +
+            " order by record_date desc,created_at desc limit ?",
+            (*parameters, max(1, min(limit, 100))),
+        ).fetchall()
+        result = []
+        for row in rows:
+            metrics = [
+                {"name": item[0], "value": item[1] if item[1] is not None else item[2], "unit": item[3], "reference_range": item[4], "abnormal": item[5], "page": item[6]}
+                for item in conn.execute(
+                    "select name,value,value_text,unit,reference_range,abnormal,page from knowledge_metrics where entry_id=? order by name", (row[0],)
+                )
+            ]
+            result.append({"id": row[0], "record_date": row[1], "category": row[2], "title": row[3], "tags": json.loads(row[4]), **json.loads(row[5]), "metrics": metrics})
+    return result
+
+
+def _find_document_reference(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("url", "document_url", "document_id", "document_token", "token"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        for candidate in value.values():
+            found = _find_document_reference(candidate)
+            if found:
+                return found
+    if isinstance(value, list):
+        for candidate in value:
+            found = _find_document_reference(candidate)
+            if found:
+                return found
+    return None
+
+
+def sync_knowledge_document(create: bool = False, force: bool = False) -> dict[str, Any]:
+    render_knowledge_document()
+    config = load_config()
+    ensure_lark_channel_env()
+    document = meta_get("knowledge_lark_doc")
+    digest = _file_sha256(KNOWLEDGE_PATH)
+    if document and not force and meta_get("knowledge_lark_hash") == digest:
+        return {"status": "unchanged", "document": document}
+    base = command_prefix(config["lark_cli"]) + ["docs"]
+    if not document and not create:
+        meta_set("knowledge_sync_status", "pending:not_configured")
+        return {"status": "pending", "reason": "not_configured"}
+    try:
+        if not document:
+            command = base + [
+                "+create", "--as", "user", "--title", "个人身体知识库", "--content", "@./" + KNOWLEDGE_PATH.name,
+                "--doc-format", "markdown", "--parent-position", "my_library",
+            ]
+            completed = subprocess.run(command, cwd=KNOWLEDGE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "document creation failed")
+            response = json.loads(completed.stdout)
+            if response.get("ok") is False:
+                raise RuntimeError("document creation was rejected")
+            document = _find_document_reference(response)
+            if not document:
+                raise RuntimeError("document created but its token was not returned")
+            meta_set("knowledge_lark_doc", document)
+        else:
+            command = base + [
+                "+update", "--as", "user", "--doc", document, "--command", "overwrite", "--content", "@./" + KNOWLEDGE_PATH.name,
+                "--doc-format", "markdown", "--revision-id", "-1",
+            ]
+            completed = subprocess.run(command, cwd=KNOWLEDGE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "document update failed")
+            response = json.loads(completed.stdout)
+            result = response.get("data", {}).get("result")
+            if response.get("ok") is False or result not in (None, "success"):
+                raise RuntimeError(f"document update result: {result or 'failed'}")
+        meta_set("knowledge_lark_hash", digest)
+        meta_set("knowledge_sync_status", "ok")
+        return {"status": "ok", "document": document}
+    except Exception as exc:
+        reason = re.sub(r"\s+", " ", str(exc)).strip()[:240] or type(exc).__name__
+        meta_set("knowledge_sync_status", "pending:" + reason)
+        return {"status": "pending", "reason": reason}
+
+
+def add_knowledge(path: Path, source_id: str, extra_sources: list[Path], no_sync: bool = False) -> int:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("knowledge JSON must be an object")
+    record_date = str(payload.get("record_date") or date.today().isoformat())
+    date.fromisoformat(record_date)
+    title, category = str(payload.get("title", "")).strip(), str(payload.get("category", "")).strip()
+    if not title or not category:
+        raise ValueError("knowledge title and category are required")
+    tags = list(dict.fromkeys(_text_list(payload.get("tags"))))
+    metrics = [item for item in _json_list(payload.get("metrics")) if isinstance(item, dict) and str(item.get("name", "")).strip()]
+    body = {
+        "facts": _text_list(payload.get("facts")),
+        "comparison": _text_list(payload.get("comparison")),
+        "analysis": _text_list(payload.get("analysis")),
+        "uncertainty": _text_list(payload.get("uncertainty")),
+        "current": payload.get("current") if isinstance(payload.get("current"), dict) else {},
+        "page_count": payload.get("page_count"),
+        "pages_processed": _json_list(payload.get("pages_processed")),
+    }
+    if not any((body["facts"], body["analysis"], metrics)):
+        raise ValueError("knowledge entry needs facts, analysis, or metrics")
+    raw_sources = [Path(item) for item in _text_list(payload.get("source_files"))] + extra_sources
+    source_records = [_store_knowledge_source(item, record_date) for item in raw_sources]
+    source_hashes = list(dict.fromkeys(item["sha256"] for item in source_records))
+    stable_payload = {**payload, "source_files": source_hashes}
+    entry_id = request_id("knowledge", source_id, stable_payload)
+    with db() as conn:
+        if conn.execute("select 1 from knowledge_entries where id=?", (entry_id,)).fetchone():
+            render_knowledge_document()
+            print(json.dumps({"status": "duplicate", "id": entry_id, "path": str(KNOWLEDGE_PATH)}, ensure_ascii=False))
+            return 0
+        automatic = _automatic_metric_comparisons(conn, metrics)
+        body["comparison"] = list(dict.fromkeys(body["comparison"] + automatic))
+        created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        conn.execute(
+            "insert into knowledge_entries(id,record_date,category,title,tags_json,body_json,source_hashes_json,created_at) values(?,?,?,?,?,?,?,?)",
+            (entry_id, record_date, category, title, json.dumps(tags, ensure_ascii=False), json.dumps(body, ensure_ascii=False), json.dumps(source_hashes), created_at),
+        )
+        for metric in metrics:
+            value, value_text = _metric_value(metric)
+            conn.execute(
+                "insert into knowledge_metrics(entry_id,name,value,value_text,unit,reference_range,abnormal,page) values(?,?,?,?,?,?,?,?)",
+                (entry_id, str(metric["name"]).strip(), value, value_text, str(metric.get("unit", "")).strip(), str(metric.get("reference_range", "")).strip(), str(metric.get("abnormal", "")).strip(), metric.get("page")),
+            )
+    render_knowledge_document()
+    sync = {"status": "skipped"} if no_sync else sync_knowledge_document()
+    print(json.dumps({"status": "added", "id": entry_id, "path": str(KNOWLEDGE_PATH), "sources": len(source_hashes), "sync": sync}, ensure_ascii=False))
+    return 0
+
+
+def knowledge_status() -> dict[str, Any]:
+    render_knowledge_document()
+    with db() as conn:
+        count = conn.execute("select count(*) from knowledge_entries").fetchone()[0]
+        categories = [dict(category=row[0], count=row[1]) for row in conn.execute("select category,count(*) from knowledge_entries group by category order by category")]
+    return {
+        "path": str(KNOWLEDGE_PATH),
+        "entries": count,
+        "categories": categories,
+        "lark_document": meta_get("knowledge_lark_doc") or "",
+        "sync_status": meta_get("knowledge_sync_status") or "not_configured",
+    }
 
 
 def secret_get(name: str) -> str | None:
@@ -1514,8 +1877,9 @@ def doctor() -> int:
         history = {
             "meta": conn.execute("select count(*) from meta").fetchone()[0],
             "writes": conn.execute("select count(*) from writes").fetchone()[0],
+            "knowledge": conn.execute("select count(*) from knowledge_entries").fetchone()[0],
         }
-    print(json.dumps({"commands": commands, "mi_authenticated": mi_authenticated, "secrets": secrets, "chat_id": bool(config.get("chat_id")), "model": model_diagnostic(config), "state": str(STATE_PATH), "history": history}, ensure_ascii=False, indent=2))
+    print(json.dumps({"commands": commands, "mi_authenticated": mi_authenticated, "secrets": secrets, "chat_id": bool(config.get("chat_id")), "model": model_diagnostic(config), "state": str(STATE_PATH), "knowledge": knowledge_status(), "history": history}, ensure_ascii=False, indent=2))
     return 0 if all(commands.values()) and all(secrets.values()) and mi_authenticated else 1
 
 
@@ -1568,6 +1932,45 @@ def self_check(data_dir: Path) -> int:
         assert first["writes"] == 1 and second["writes"] == 0
     set_data_dir(original)
     print("self-check: legacy-migration ok")
+    with tempfile.TemporaryDirectory(prefix="body knowledge ") as temp:
+        root = Path(temp)
+        set_data_dir(root / "private")
+        source = root / "report.pdf"
+        source.write_bytes(b"%PDF-1.4\n% self-check only\n")
+        first_payload = root / "first.json"
+        first_payload.write_text(
+            json.dumps(
+                {
+                    "record_date": "2026-01-01", "title": "首次化验", "category": "检验检查", "tags": ["血脂"],
+                    "facts": ["来源事实"], "analysis": ["仅用于自检"], "uncertainty": ["非真实报告"],
+                    "current": {"最近检查": "2026-01-01"}, "page_count": 1, "pages_processed": [1],
+                    "metrics": [{"name": "LDL-C", "value": 3.1, "unit": "mmol/L", "reference_range": "<3.4", "page": 1}],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        second_payload = root / "second.json"
+        second_payload.write_text(
+            json.dumps(
+                {
+                    "record_date": "2026-02-01", "title": "复查", "category": "检验检查", "tags": ["血脂"],
+                    "facts": ["复查来源事实"], "metrics": [{"name": "LDL-C", "value": 3.4, "unit": "mmol/L", "page": 1}],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        assert add_knowledge(first_payload, "self-check-1", [source], no_sync=True) == 0
+        assert add_knowledge(second_payload, "self-check-2", [source], no_sync=True) == 0
+        found = knowledge_search("LDL-C")
+        assert len(found) == 2 and any("3.1 → 3.4" in item for item in found[0]["comparison"])
+        with db() as conn:
+            assert conn.execute("select count(*) from knowledge_sources").fetchone()[0] == 1
+        document = render_knowledge_document().read_text(encoding="utf-8")
+        assert "## 当前概况" in document and "## 分类索引" in document and "3.1 → 3.4" in document
+    set_data_dir(original)
+    print("self-check: private-knowledge ok")
     fake_search = "0123456789abcdef" * 2
     fake_llm = "xjllm_" + "test-token"
     tokens = unique_tokens({"text": f"Bearer {fake_search} {fake_llm}"})
@@ -1687,6 +2090,23 @@ def main() -> int:
     keys.add_argument("--message-id", action="append", default=[])
     keys.add_argument("--start", required=True)
     keys.add_argument("--inspect", action="store_true")
+    knowledge = sub.add_parser("knowledge", help="Manage the private body knowledge base")
+    knowledge_sub = knowledge.add_subparsers(dest="knowledge_command", required=True)
+    knowledge_sub.add_parser("status")
+    knowledge_sub.add_parser("show")
+    knowledge_search_parser = knowledge_sub.add_parser("search")
+    knowledge_search_parser.add_argument("--query", default="")
+    knowledge_search_parser.add_argument("--category", default="")
+    knowledge_search_parser.add_argument("--limit", type=int, default=10)
+    knowledge_add_parser = knowledge_sub.add_parser("add")
+    knowledge_add_parser.add_argument("--json-file", type=Path, required=True)
+    knowledge_add_parser.add_argument("--source-id", required=True)
+    knowledge_add_parser.add_argument("--source", type=Path, action="append", default=[])
+    knowledge_add_parser.add_argument("--no-sync", action="store_true")
+    knowledge_sync_parser = knowledge_sub.add_parser("sync")
+    knowledge_sync_parser.add_argument("--create", action="store_true")
+    knowledge_sync_parser.add_argument("--force", action="store_true")
+    knowledge_sync_parser.add_argument("--doc", help="Existing Lark document URL or token")
     args = parser.parse_args()
     set_data_dir(args.data_dir or _default_data_dir())
     if args.command == "self-check":
@@ -1701,6 +2121,25 @@ def main() -> int:
         return import_xunji_keys(args.chat_id or load_config().get("chat_id", ""), mappings, args.start, args.inspect)
     if args.command == "doctor":
         return doctor()
+    if args.command == "knowledge":
+        if args.knowledge_command == "status":
+            print(json.dumps(knowledge_status(), ensure_ascii=False, indent=2))
+            return 0
+        if args.knowledge_command == "show":
+            print(render_knowledge_document().read_text(encoding="utf-8"))
+            return 0
+        if args.knowledge_command == "search":
+            print(json.dumps(knowledge_search(args.query, args.category, args.limit), ensure_ascii=False, indent=2))
+            return 0
+        if args.knowledge_command == "add":
+            return add_knowledge(args.json_file, args.source_id, args.source, args.no_sync)
+        if args.knowledge_command == "sync":
+            if args.doc:
+                meta_set("knowledge_lark_doc", args.doc.strip())
+                meta_set("knowledge_lark_hash", "")
+            result = sync_knowledge_document(args.create, args.force)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result["status"] in {"ok", "unchanged"} else 2
     if args.command == "daily":
         return run_daily(args.force, args.dry_run)
     if args.command == "weekly":
