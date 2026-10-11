@@ -46,6 +46,7 @@ $python = Join-Path $venv 'Scripts\python.exe'
 $pythonw = Join-Path $venv 'Scripts\pythonw.exe'
 $dataArgument = if ($useDefaultData) { '' } else { " --data-dir `"$data`"" }
 $dailyArguments = "`"$coach`"$dataArgument daily"
+$weeklyArguments = "`"$coach`"$dataArgument weekly"
 $mealArguments = "`"$coach`"$dataArgument meal-reminder"
 $coachArguments = @($coach)
 if (-not $useDefaultData) {
@@ -79,6 +80,7 @@ if ($WhatIfPreference) {
     }
     [void]$PSCmdlet.ShouldProcess($skillTarget, "Create junction to $skillSource")
     [void]$PSCmdlet.ShouldProcess('BodyCoach-DailyReport', "Register pythonw.exe $dailyArguments (AtLogOn + PT3M)")
+    [void]$PSCmdlet.ShouldProcess('BodyCoach-WeeklyReport', "Register pythonw.exe $weeklyArguments (Sunday 23:00, StartWhenAvailable)")
     [void]$PSCmdlet.ShouldProcess('BodyCoach-MealReminder', "Register pythonw.exe $mealArguments (Daily 23:30)")
     return
 }
@@ -155,6 +157,10 @@ $dailyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $dailyArgumen
 $dailyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $dailyTrigger.Delay = 'PT3M'
 Register-ScheduledTask -TaskName 'BodyCoach-DailyReport' -Action $dailyAction -Trigger $dailyTrigger -Settings $settings -Description 'Send the daily private fitness report after logon' -Force | Out-Null
+
+$weeklyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $weeklyArguments
+$weeklyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '23:00'
+Register-ScheduledTask -TaskName 'BodyCoach-WeeklyReport' -Action $weeklyAction -Trigger $weeklyTrigger -Settings $settings -Description 'Send the weekly private fitness report on Sunday night' -Force | Out-Null
 
 $mealAction = New-ScheduledTaskAction -Execute $pythonw -Argument $mealArguments
 $mealTrigger = New-ScheduledTaskTrigger -Daily -At '23:30'

@@ -91,6 +91,11 @@ def missing_dates(last_sent: date | None, today: date) -> list[date]:
     return result
 
 
+def weekly_period(today: date) -> tuple[date, date]:
+    end = today - timedelta(days=(today.weekday() + 1) % 7)
+    return end - timedelta(days=6), end
+
+
 def diet_auto_allowed(food: dict[str, Any]) -> bool:
     if food.get("analyze_only"):
         return False
@@ -609,12 +614,12 @@ async def _mi_query(config: dict[str, Any], start: date, end: date) -> dict[str,
     return result
 
 
-def mi_snapshot(config: dict[str, Any], days: int = 7) -> dict[str, Any]:
+def mi_snapshot(config: dict[str, Any], days: int = 7, end: date | None = None) -> dict[str, Any]:
     if not shutil.which(config["mi_cli"]):
         return {"status": "missing", "error": "mi-fitness-mcp 未安装"}
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
-    end = date.today()
+    end = end or date.today()
     start = end - timedelta(days=days)
     sync = subprocess.run([config["mi_cli"], "sync", "--start-date", start.isoformat(), "--end-date", end.isoformat()], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, env=env)
     try:
@@ -1177,8 +1182,9 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recomm
 
 
 def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = False, context: list[str] | None = None) -> str:
-    payload = {"summary": context or [], "mi": compact_data(mi), "xunji": compact_data(xunji), "weekly": weekly}
+    payload = {"summary": context or [], "weekly": weekly}
     if weekly:
+        payload.update({"mi": compact_data(mi), "xunji": compact_data(xunji)})
         format_rule = (
             "结合一周趋势，用恢复、训练、营养三个标签各写1至2句，总计不超过360个汉字；"
             "不用Markdown标题或列表。指出主要变化、下周行动和依据，"
@@ -1320,7 +1326,7 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     advice = model_advice(config, mi, xunji, context=lines)
     lines.append("教练建议：" + advice)
     progress = daily_progress(mi_cache_overview(today - timedelta(days=1)), today - timedelta(days=1))
-    title = f"健身卡片 · {today.month}月{today.day}日"
+    title = f"健身日报 · {today.month}月{today.day}日"
     if dry_run:
         preview_report(title, lines, progress)
         return 0
@@ -1332,28 +1338,30 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
         meta_set("last_split_training_date", split_state["source_date"])
     if body_change:
         meta_set("last_body_measurement", body_change["timestamp"])
-    if today.weekday() == 0 and meta_get("last_weekly") != today.isoformat():
-        run_weekly()
     return 0
 
 
 def run_weekly(dry_run: bool = False) -> int:
     config = load_config()
     today = date.today()
-    mi = mi_snapshot(config, 14)
-    xunji = xunji_snapshot(today, weekly=True)
+    period_start, period_end = weekly_period(today)
+    if not dry_run and meta_get("last_weekly") == period_end.isoformat():
+        return 0
+    mi = mi_snapshot(config, 14, period_end)
+    xunji = xunji_snapshot(period_end, weekly=True)
+    title = f"健身周报 · {period_start.month}月{period_start.day}日—{period_end.month}月{period_end.day}日"
     lines = [
-        "周期：最近7天",
+        f"周期：{period_start.isoformat()} 至 {period_end.isoformat()}",
         "训练、睡眠、步数与饮食按趋势判断，不评价单日波动",
         "模板更新：周报仅提出建议；展示具体差异并经你确认后才会修改",
         "教练分析：" + model_advice(config, mi, xunji, weekly=True),
     ]
     if dry_run:
-        preview_report("健身周报", lines)
+        preview_report(title, lines)
         return 0
-    if not send_report(config, "健身周报", lines, request_id("weekly", today.isoformat(), lines)):
+    if not send_report(config, title, lines, request_id("weekly", period_end.isoformat(), lines)):
         return 2
-    meta_set("last_weekly", today.isoformat())
+    meta_set("last_weekly", period_end.isoformat())
     return 0
 
 
@@ -1489,6 +1497,13 @@ def self_check(data_dir: Path) -> int:
     else:
         os.environ["LARK_CHANNEL_PROFILE"] = previous
     print("self-check: onboarding-and-bridge-env ok")
+    assert weekly_period(date(2026, 10, 11)) == (date(2026, 10, 5), date(2026, 10, 11))
+    assert weekly_period(date(2026, 10, 12)) == (date(2026, 10, 5), date(2026, 10, 11))
+    daily_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["已校验汇总"])
+    weekly_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, weekly=True, context=["趋势汇总"])
+    assert '"mi"' not in daily_prompt and '"xunji"' not in daily_prompt
+    assert '"mi"' in weekly_prompt and '"xunji"' in weekly_prompt
+    print("self-check: report-period-and-prompt ok")
     assert model_diagnostic({"model_analysis": False, "codex_cli": "missing"})["reason"] == "disabled"
     assert model_diagnostic({"model_analysis": True, "codex_cli": "missing"})["reason"] == "missing_cli"
     original_model_error = meta_get("last_model_error")
