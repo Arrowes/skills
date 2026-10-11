@@ -15,10 +15,10 @@ When explicitly activated in a fresh or reset session, run `doctor` once. Confir
 | --- | --- |
 | Analyze data or preview a report | Use `daily --dry-run`, `weekly --dry-run`, or `doctor`; these may read sources but must not send or write externally. |
 | Send a daily/weekly report | Ask for confirmation immediately before running without `--dry-run`; use `daily --force` only for an explicitly requested resend. |
-| Record food from text/photo | Extract meal type, food, amount, unit, date, and nutrition estimate; show uncertain recognition for confirmation. Then pass JSON through `food --json-file ... --source-id ...`. |
+| Record food from text/photo | For a text breakfast/lunch/dinner log, extract meal type, food, amount, unit, date, and nutrition estimate, then write it immediately without asking for confirmation. For photos, show uncertain recognition for confirmation. Then pass JSON through `food --json-file ... --source-id ...`. |
 | Change a training template | Show the concrete diff and obtain separate confirmation. Reports may recommend changes but never apply them. |
 
-Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, `unit`, `date`, and `ntr`. Do not invent missing portions. Photos with ambiguous foods or quantities require user confirmation.
+Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, `unit`, `date`, and `ntr`. Do not invent missing portions. Text meal logs are pre-authorized for immediate recording; state any ordinary serving-size or nutrition estimates in the completion message instead of pausing for confirmation. Photos with ambiguous foods or quantities require user confirmation.
 
 The strength split advances only after a recorded standalone strength session. Fixed activities, missed sessions, and report generation do not advance it.
 

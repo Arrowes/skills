@@ -625,7 +625,9 @@ def mi_snapshot(config: dict[str, Any], days: int = 7) -> dict[str, Any]:
 
 
 def xunji_snapshot(day: date, weekly: bool = False) -> dict[str, Any]:
-    start = day - timedelta(days=6 if weekly else 1)
+    # Keep enough history to recover the latest non-zero nutrition target when
+    # Xunji returns zero limits for a day that has standalone food records.
+    start = day - timedelta(days=6)
     result: dict[str, Any] = {}
     calls = [
         (
@@ -1141,6 +1143,11 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recomm
     carbs = totals.get("totalCarb")
     fat = totals.get("totalFat")
     targets = xunji_nutrition_targets(diet)
+
+    def nutrition_line(label: str, value: Any, target: str, unit: str) -> str:
+        actual = f"{value:.0f}" if isinstance(value, (int, float)) else "暂无"
+        goal = f" / {targets[target]}" if targets else ""
+        return f"{label}：{actual}{goal} {unit}"
     summary_plan = initial_week_plan().get("周" + "一二三四五六日"[summary_day.weekday()])
     completion = yesterday_completion(xunji)
     # ponytail: day-level association; use time overlap if Xunji exposes reliable session times.
@@ -1157,10 +1164,10 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recomm
         f"昨日运动：{workout_brief(mi, summary_day, free_label)}",
         f"昨日完成：{completion}",
         f"今日训练：{today_training}",
-        f"饮食热量：{calories:.0f} / {targets['calories']} kcal" if isinstance(calories, (int, float)) and targets else (f"饮食热量：暂无 / 目标 {targets['calories']} kcal" if targets else "饮食热量：暂无"),
-        f"蛋白质：{protein:.0f} / {targets['protein']} g" if isinstance(protein, (int, float)) and targets else (f"蛋白质：暂无 / 目标 {targets['protein']} g" if targets else "蛋白质：暂无"),
-        f"碳水：{carbs:.0f} / {targets['carbs']} g" if isinstance(carbs, (int, float)) and targets else (f"碳水：暂无 / 目标 {targets['carbs']} g" if targets else "碳水：暂无"),
-        f"脂肪：{fat:.0f} / {targets['fat']} g" if isinstance(fat, (int, float)) and targets else (f"脂肪：暂无 / 目标 {targets['fat']} g" if targets else "脂肪：暂无"),
+        nutrition_line("饮食热量", calories, "calories", "kcal"),
+        nutrition_line("蛋白质", protein, "protein", "g"),
+        nutrition_line("碳水", carbs, "carbs", "g"),
+        nutrition_line("脂肪", fat, "fat", "g"),
     ]
     if mi.get("status") != "ok":
         lines.append(f"小米数据：{mi.get('status', 'unknown')}")
@@ -1397,6 +1404,11 @@ def write_food(path: Path, source_id: str) -> int:
 def doctor() -> int:
     config = load_config()
     commands = {name: bool(shutil.which(value) or Path(value).exists()) for name, value in (("mi", config["mi_cli"]), ("lark", config["lark_cli"]), ("codex", config["codex_cli"]))}
+    if commands["mi"]:
+        try:
+            commands["mi"] = subprocess.run([config["mi_cli"], "--help"], capture_output=True, timeout=15).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            commands["mi"] = False
     secrets = {name: bool(secret_get(name)) for name in ("xunji_train_key", "xunji_diet_key", "xunji_food_search_key", "xunji_body_key", "xunji_template_key")}
     try:
         from mi_fitness_mcp.auth import load_mi_fitness_token
@@ -1491,6 +1503,23 @@ def self_check(data_dir: Path) -> int:
                 conn.execute("insert or replace into meta(key,value) values('last_model_error',?)", (original_model_error,))
     print("self-check: model-diagnostic ok")
     fake_cache = {"activity": {}, "sleep": {}, "heart": {}, "body": {}}
+    diet_with_prior_target = {
+        "res": {
+            "days": [
+                {"date": "2026-10-09", "foods": {"limits": {"protein": 162, "carb": 216, "fat": 72}}},
+                {
+                    "date": "2026-10-10",
+                    "totals": {"totalCal": 1437.315, "totalProtein": 71.424, "totalCarb": 154.866, "totalFat": 59.287},
+                    "foods": {"limits": {"protein": 0, "carb": 0, "fat": 0}},
+                },
+            ]
+        }
+    }
+    with patch(__name__ + ".mi_cache_overview", return_value=fake_cache):
+        nutrition = local_summary({"status": "ok"}, {"training": [], "diet": diet_with_prior_target}, date(2026, 10, 11))
+    assert "饮食热量：1437 / 2160 kcal" in nutrition
+    assert "蛋白质：71 / 162 g" in nutrition
+    print("self-check: nutrition-target-fallback ok")
     fake_xunji = {"training": [], "diet": {}, "body": {}}
     fake_config = {"model_analysis": False, "codex_cli": "missing", "chat_id": "chat-test", "lark_cli": "lark-cli"}
     with (

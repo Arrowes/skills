@@ -99,6 +99,15 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 $dependency = 'mi-fitness-mcp[api] @ git+https://github.com/HUAYUE1024/mi-fitness-mcp-cn.git@v0.2.2'
 Invoke-Checked $python @('-m', 'pip', 'install', $dependency)
+$miCli = Join-Path $venv 'Scripts\mi-fitness-mcp.exe'
+& $miCli --help *> $null
+if ($LASTEXITCODE -ne 0) {
+    Invoke-Checked $python @('-m', 'pip', 'install', '--force-reinstall', '--no-deps', $dependency)
+    & $miCli --help *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "mi-fitness-mcp launcher is not executable after repair"
+    }
+}
 
 if ($LegacyRoot) {
     if (-not (Test-Path -LiteralPath $legacy -PathType Container)) {
