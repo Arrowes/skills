@@ -619,9 +619,11 @@ def _store_knowledge_source(path: Path, record_date: str) -> dict[str, Any]:
     if existing:
         return {"sha256": digest, "stored_name": existing[0], "original_name": existing[1], "size_bytes": existing[2]}
     KNOWLEDGE_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
-    stored_name = f"{record_date}-{digest[:10]}-{_safe_source_name(source.name)}"
-    destination = KNOWLEDGE_SOURCES_DIR / stored_name
-    shutil.copy2(source, destination)
+    if source.parent == KNOWLEDGE_SOURCES_DIR.resolve():
+        stored_name = source.name
+    else:
+        stored_name = f"{record_date}-{digest[:10]}-{_safe_source_name(source.name)}"
+        shutil.copy2(source, KNOWLEDGE_SOURCES_DIR / stored_name)
     with db() as conn:
         conn.execute(
             "insert or ignore into knowledge_sources(sha256,stored_name,original_name,size_bytes,added_at) values(?,?,?,?,?)",
@@ -674,6 +676,11 @@ def _markdown_text(value: Any) -> str:
     return text
 
 
+def _markdown_link(label: str, value: str) -> str:
+    url = value.strip()
+    return f"[{_markdown_text(label)}]({url})" if re.fullmatch(r"https?://[^\s]+", url) else _markdown_text(value)
+
+
 def render_knowledge_document() -> Path:
     KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
     with db() as conn:
@@ -703,14 +710,16 @@ def render_knowledge_document() -> Path:
                     current.pop(str(key), None)
                 else:
                     current[str(key)] = str(value)
+    manual_document = meta_get("training_manual_lark_doc")
     lines = [
         "# 个人身体知识库",
         "",
         "> 本文档由 Body Fitness Coach 维护。本地版本是主记录；飞书文档是便于查看的单向镜像。原始报告和图片仅保存在本机。",
         "",
-        "## 当前概况",
-        "",
     ]
+    if manual_document:
+        lines.extend(["## 常用入口", "", f"- **个人力量训练手册**：{_markdown_link('打开飞书文档', manual_document)}", ""])
+    lines.extend(["## 当前概况", ""])
     if current:
         lines.extend(f"- **{_markdown_text(key)}**：{_markdown_text(value)}" for key, value in current.items())
     else:
@@ -916,6 +925,7 @@ def knowledge_status() -> dict[str, Any]:
         "entries": count,
         "categories": categories,
         "lark_document": meta_get("knowledge_lark_doc") or "",
+        "training_manual_lark_document": meta_get("training_manual_lark_doc") or "",
         "sync_status": meta_get("knowledge_sync_status") or "not_configured",
     }
 
@@ -1967,7 +1977,9 @@ def self_check(data_dir: Path) -> int:
         assert len(found) == 2 and any("3.1 → 3.4" in item for item in found[0]["comparison"])
         with db() as conn:
             assert conn.execute("select count(*) from knowledge_sources").fetchone()[0] == 1
+        meta_set("training_manual_lark_doc", "https://example.feishu.cn/docx/manual")
         document = render_knowledge_document().read_text(encoding="utf-8")
+        assert "[打开飞书文档](https://example.feishu.cn/docx/manual)" in document
         assert "## 当前概况" in document and "## 分类索引" in document and "3.1 → 3.4" in document
     set_data_dir(original)
     print("self-check: private-knowledge ok")
@@ -2107,6 +2119,7 @@ def main() -> int:
     knowledge_sync_parser.add_argument("--create", action="store_true")
     knowledge_sync_parser.add_argument("--force", action="store_true")
     knowledge_sync_parser.add_argument("--doc", help="Existing Lark document URL or token")
+    knowledge_sync_parser.add_argument("--manual-doc", help="Living Lark training manual URL")
     args = parser.parse_args()
     set_data_dir(args.data_dir or _default_data_dir())
     if args.command == "self-check":
@@ -2136,6 +2149,9 @@ def main() -> int:
         if args.knowledge_command == "sync":
             if args.doc:
                 meta_set("knowledge_lark_doc", args.doc.strip())
+                meta_set("knowledge_lark_hash", "")
+            if args.manual_doc:
+                meta_set("training_manual_lark_doc", args.manual_doc.strip())
                 meta_set("knowledge_lark_hash", "")
             result = sync_knowledge_document(args.create, args.force)
             print(json.dumps(result, ensure_ascii=False, indent=2))

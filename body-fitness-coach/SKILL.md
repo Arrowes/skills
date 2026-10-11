@@ -18,7 +18,7 @@ When explicitly activated in a fresh or reset session, run `doctor` once. Confir
 | Record food from text/photo | For a text breakfast/lunch/dinner log, extract meal type, food, amount, unit, date, and nutrition estimate, then write it immediately without asking for confirmation. For photos, show uncertain recognition for confirmation. Then pass JSON through `food --json-file ... --source-id ...`. |
 | Record personal body knowledge | When the user provides a report, measurement, body image, supplement, available equipment, medical history, symptom, or any other durable fact useful for future body/training advice, record it locally without asking for a second confirmation. Follow the knowledge workflow below. |
 | View or use personal body knowledge | Use `knowledge status`, `knowledge search`, or `knowledge show`. Retrieve only the relevant entries for the current task. |
-| Change a training template | Show the concrete diff and obtain separate confirmation. Reports may recommend changes but never apply them. |
+| Change a training template | Show the concrete diff and obtain separate confirmation. After approval, update the living Lark training manual, append its dated change record, record the same change in the private knowledge base, and sync the mirror. Reports may recommend changes but never apply them. |
 
 Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, `unit`, `date`, and `ntr`. Do not invent missing portions. Text meal logs are pre-authorized for immediate recording; state any ordinary serving-size or nutrition estimates in the completion message instead of pausing for confirmation. Photos with ambiguous foods or quantities require user confirmation.
 
@@ -44,6 +44,8 @@ Knowledge JSON fields are: required `record_date`, `title`, and `category`; opti
 Daily reports, weekly reports, meal reminders, and their model prompts must never read the knowledge tables or `BODY_KNOWLEDGE.md`. Only retrieve targeted knowledge when the user's task actually needs it. `knowledge show` is for an explicit full review; normally prefer a narrow `knowledge search` to reduce token use.
 
 The local Markdown is the primary readable record. Its Lark document is a one-way mirror: a local write succeeds even if Lark is unavailable, failed sync is marked pending, and the next knowledge operation retries once a document is configured. Raw source files are not uploaded. Create or configure the mirror with `knowledge sync --create` or `knowledge sync --doc <url-or-token>`. Never start Lark OAuth from a group chat; ask the user to authorize in a private chat if user identity is unavailable.
+
+The living strength-training manual is a separate editable Lark document. Configure its URL with `knowledge sync --manual-doc <url>`, which places a persistent link before the knowledge snapshot. When the user confirms a training-template change, update the applicable current-plan section in that manual and append a dated item under `更新记录` containing the before/after change and reason; then add the same confirmed change as a `训练方案` knowledge entry and sync the mirror. Keep imported source files as immutable evidence rather than rewriting them. If the manual update fails, report that the change was not fully applied.
 
 When a scheduled weekly report was missed while the computer was unavailable, the next weekly run sends every unsent completed week oldest-first and saves progress after each successful card. A first run sends only the latest completed week.
 
