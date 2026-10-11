@@ -15,12 +15,12 @@ When explicitly activated in a fresh or reset session, run `doctor` once. Confir
 | --- | --- |
 | Analyze data or preview a report | Use `daily --dry-run`, `weekly --dry-run`, or `doctor`; these may read sources but must not send or write externally. |
 | Send a daily/weekly report | Ask for confirmation immediately before running without `--dry-run`; use `daily --force` only for an explicitly requested resend. |
-| Record food from text/photo | For a text breakfast/lunch/dinner log, extract meal type, food, amount, unit, date, and nutrition estimate, then write it immediately without asking for confirmation. For photos, show uncertain recognition for confirmation. Then pass JSON through `food --json-file ... --source-id ...`. |
+| Record food from text/photo | Infer meal type, foods, portions, and nutrition from the message, photo, time, and recent context, then write immediately without confirmation. Ask only when the meal cannot be identified well enough to create a useful record. Then pass JSON through `food --json-file ... --source-id ...`. |
 | Record personal body knowledge | When the user provides a report, measurement, body image, supplement, available equipment, medical history, symptom, or any other durable fact useful for future body/training advice, record it locally without asking for a second confirmation. Follow the knowledge workflow below. |
 | View or use personal body knowledge | Use `knowledge status`, `knowledge search`, or `knowledge show`. Retrieve only the relevant entries for the current task. |
 | Change a training template | Show the concrete diff and obtain separate confirmation. After approval, update the living Lark training manual, append its dated change record, record the same change in the private knowledge base, and sync the mirror. Reports may recommend changes but never apply them. |
 
-Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, `unit`, `date`, and `ntr`. Do not invent missing portions. Text meal logs are pre-authorized for immediate recording; state any ordinary serving-size or nutrition estimates in the completion message instead of pausing for confirmation. Photos with ambiguous foods or quantities require user confirmation.
+Food JSON must contain `foods`; every item needs `meal_type`, `name`, `amount`, `unit`, `date`, and `ntr`. Prefer a reasonable ordinary-serving estimate over a clarification round, and state the important portion or nutrition assumptions after writing so the user can correct them. After every food write, report calories, protein, carbohydrates, and fat for both the recorded meal and the day's cumulative total, alongside the daily targets when available.
 
 The strength split advances only after a recorded standalone strength session. Fixed activities, missed sessions, and report generation do not advance it.
 
