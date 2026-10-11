@@ -1320,10 +1320,11 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     advice = model_advice(config, mi, xunji, context=lines)
     lines.append("教练建议：" + advice)
     progress = daily_progress(mi_cache_overview(today - timedelta(days=1)), today - timedelta(days=1))
+    title = f"健身卡片 · {today.month}月{today.day}日"
     if dry_run:
-        preview_report("昨日总结 · 今日安排", lines, progress)
+        preview_report(title, lines, progress)
         return 0
-    if not send_report(config, "昨日总结 · 今日安排", lines, request_id("daily", today.isoformat(), lines), progress):
+    if not send_report(config, title, lines, request_id("daily", today.isoformat(), lines), progress):
         return 2
     meta_set("last_daily", today.isoformat())
     if split_state["advanced"]:
