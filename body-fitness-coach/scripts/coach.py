@@ -1123,6 +1123,54 @@ def compact_data(data: Any, depth: int = 0) -> Any:
     return data
 
 
+def sleep_asleep_minutes(sleep: dict[str, Any]) -> float | None:
+    """Return actual sleep time, excluding awake stages when Xiaomi exposes them."""
+    stages = sleep.get("stages")
+    if isinstance(stages, str):
+        try:
+            stages = json.loads(stages)
+        except json.JSONDecodeError:
+            stages = None
+    if isinstance(stages, list):
+        awake_seen = False
+        asleep = 0.0
+        for stage in stages:
+            if not isinstance(stage, dict) or not isinstance(stage.get("minutes"), (int, float)):
+                continue
+            if str(stage.get("stage", "")).lower() == "awake":
+                awake_seen = True
+            else:
+                asleep += float(stage["minutes"])
+        if awake_seen and asleep > 0:
+            return asleep
+    duration, awake = sleep.get("duration_minutes"), sleep.get("time_awake_minutes")
+    if isinstance(duration, (int, float)) and isinstance(awake, (int, float)) and awake > 0:
+        return max(float(duration) - float(awake), 0)
+    value = sleep.get("time_asleep_minutes") or duration
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _sleep_session(conn: sqlite3.Connection, day: date | None) -> sqlite3.Row | None:
+    fields = "start_at,end_at,duration_minutes,time_asleep_minutes,time_awake_minutes,sleep_score,is_nap,stages"
+    if day is None:
+        return conn.execute(
+            f"select {fields} from sleep_sessions where coalesce(is_nap,0)=0 order by end_at desc limit 1"
+        ).fetchone()
+    # A day's overnight recovery normally ends the following morning. Only fall
+    # back to a same-day ending session when that following-morning record is absent.
+    for end_day in ((day + timedelta(days=1)).isoformat(), day.isoformat()):
+        row = conn.execute(
+            f"select {fields} from sleep_sessions "
+            "where substr(end_at,1,10)=? and coalesce(is_nap,0)=0 "
+            "order by case when stages like '%\"awake\"%' then 0 else 1 end, "
+            "coalesce(time_asleep_minutes,duration_minutes) desc,end_at desc limit 1",
+            (end_day,),
+        ).fetchone()
+        if row:
+            return row
+    return None
+
+
 def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
     try:
         local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
@@ -1131,7 +1179,7 @@ def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
             conn.row_factory = sqlite3.Row
             if day is None:
                 activity = conn.execute("select date,steps,distance_m,active_kcal,active_minutes from daily_activity order by date desc limit 1").fetchone()
-                sleep = conn.execute("select start_at,end_at,duration_minutes,time_asleep_minutes,sleep_score from sleep_sessions order by end_at desc limit 1").fetchone()
+                sleep = _sleep_session(conn, None)
                 heart = conn.execute(
                     "select substr(timestamp,1,10) date,min(bpm) min_bpm,max(bpm) max_bpm,"
                     "max(case when lower(sample_type) like '%rest%' then bpm end) resting_bpm "
@@ -1139,17 +1187,11 @@ def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
                 ).fetchone()
             else:
                 day_text = day.isoformat()
-                next_day_text = (day + timedelta(days=1)).isoformat()
                 activity = conn.execute(
                     "select date,steps,distance_m,active_kcal,active_minutes from daily_activity where date=? limit 1",
                     (day_text,),
                 ).fetchone()
-                sleep = conn.execute(
-                    "select start_at,end_at,duration_minutes,time_asleep_minutes,sleep_score from sleep_sessions "
-                    "where substr(end_at,1,10) in (?,?) "
-                    "order by coalesce(time_asleep_minutes,duration_minutes) desc,end_at desc limit 1",
-                    (day_text, next_day_text),
-                ).fetchone()
+                sleep = _sleep_session(conn, day)
                 heart = conn.execute(
                     "select substr(timestamp,1,10) date,min(bpm) min_bpm,max(bpm) max_bpm,"
                     "max(case when lower(sample_type) like '%rest%' then bpm end) resting_bpm "
@@ -1306,7 +1348,7 @@ def daily_training_recommendation(today: date, mi: dict[str, Any], xunji: dict[s
     """Recommend a project from recent load and recovery, never an action list."""
     yesterday = today - timedelta(days=1)
     cache = mi_cache_overview(yesterday)
-    sleep = cache.get("sleep", {}).get("time_asleep_minutes") or cache.get("sleep", {}).get("duration_minutes")
+    sleep = sleep_asleep_minutes(cache.get("sleep", {}))
     resting = cache.get("heart", {}).get("resting_bpm")
     prior_resting = [
         value
@@ -1470,7 +1512,7 @@ def daily_progress(overview: dict[str, Any], day: date | None = None) -> list[di
     sleep = overview.get("sleep", {}) if sleep_date in (day, day + timedelta(days=1)) else {}
     heart = overview.get("heart", {}) if _record_date(overview.get("heart", {}).get("date")) == day else {}
     steps = activity.get("steps")
-    asleep = sleep.get("time_asleep_minutes") or sleep.get("duration_minutes")
+    asleep = sleep_asleep_minutes(sleep)
     sleep_start, sleep_end = _clock(sleep.get("start_at")), _clock(sleep.get("end_at"))
     sleep_detail = "睡眠今日暂无"
     if isinstance(asleep, (int, float)):
@@ -1664,7 +1706,7 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date) -> lis
     steps = activity.get("steps")
     active_kcal = activity.get("active_kcal")
     distance = activity.get("distance_m")
-    sleep = sleep_data.get("time_asleep_minutes") or sleep_data.get("duration_minutes")
+    sleep = sleep_asleep_minutes(sleep_data)
     resting = heart.get("resting_bpm")
     diet = xunji.get("diet", {})
     totals = xunji_diet_day(diet, summary_day).get("totals", {})
@@ -1730,12 +1772,12 @@ def weekly_summary(mi: dict[str, Any], xunji: dict[str, Any], start: date, end: 
     sleep = [
         float(value)
         for overview in overviews
-        if isinstance(value := overview.get("sleep", {}).get("time_asleep_minutes") or overview.get("sleep", {}).get("duration_minutes"), (int, float))
+        if isinstance(value := sleep_asleep_minutes(overview.get("sleep", {})), (int, float))
     ]
     previous_sleep = [
         float(value)
         for overview in previous_overviews
-        if isinstance(value := overview.get("sleep", {}).get("time_asleep_minutes") or overview.get("sleep", {}).get("duration_minutes"), (int, float))
+        if isinstance(value := sleep_asleep_minutes(overview.get("sleep", {})), (int, float))
     ]
     resting = numbers(overviews, "heart", "resting_bpm")
     previous_resting = numbers(previous_overviews, "heart", "resting_bpm")
@@ -2202,6 +2244,14 @@ def self_check(data_dir: Path) -> int:
         raise AssertionError("unknown meal type must be rejected")
     except ValueError:
         pass
+    staged_sleep = {
+        "duration_minutes": 498,
+        "time_asleep_minutes": 498,
+        "time_awake_minutes": 0,
+        "stages": json.dumps([{"stage": "light", "minutes": 373}, {"stage": "awake", "minutes": 125}]),
+    }
+    assert sleep_asleep_minutes(staged_sleep) == 373
+    assert sleep_asleep_minutes({"duration_minutes": 464, "time_asleep_minutes": 464, "stages": '[{"stage":"light","minutes":464}]'}) == 464
     assert "subtitle" not in report_card("健身日报 · 10月11日", [])["header"]
     daily_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["已校验汇总"])
     weekly_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, weekly=True, context=["趋势汇总"])
