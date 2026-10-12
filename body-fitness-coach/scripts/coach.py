@@ -141,6 +141,21 @@ def normalize_food_units(foods: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return foods
 
 
+def normalize_food_meal_types(foods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aliases = {
+        "breakfast": {"breakfast", "morning", "早餐"},
+        "lunch": {"lunch", "noon", "midday", "午餐"},
+        "dinner": {"dinner", "night", "evening", "晚餐"},
+    }
+    for food in foods:
+        value = str(food.get("meal_type", "")).strip().lower()
+        canonical = next((name for name, values in aliases.items() if value in values), None)
+        if canonical is None:
+            raise ValueError(f"unsupported meal_type: {food.get('meal_type', '')}")
+        food["meal_type"] = canonical
+    return foods
+
+
 def request_id(kind: str, source_id: str, payload: Any) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(f"{source_id}\n{raw}".encode()).hexdigest()[:24]
@@ -435,9 +450,9 @@ def strength_template_plan(split: str) -> dict[str, Any]:
 
 def initial_week_plan() -> dict[str, dict[str, Any]]:
     return {
-        "周四": {"name": "胸背课（全身特训参考）", "items": ["如参加则按课程训练", "不推进力量模板队列"]},
-        "周六": {"name": "游泳（有氧参考）", "items": ["如训练可选轻中强度游泳", "不推进力量模板队列"]},
-        "周日": {"name": "BODY PUMP（全身特训参考）", "items": ["如参加则按课程训练", "不推进力量模板队列"]},
+        "周四": {"name": "胸背课（全身特训参考）", "items": ["如参加则按课程训练"]},
+        "周六": {"name": "游泳（有氧参考）", "items": ["如训练可选轻中强度游泳"]},
+        "周日": {"name": "BODY PUMP（全身特训参考）", "items": ["如参加则按课程训练"]},
     }
 
 
@@ -475,40 +490,6 @@ def classify_training_split(train: dict[str, Any]) -> str | None:
     return None
 
 
-def completed_split_for_day(xunji: dict[str, Any], day: date) -> str | None:
-    for entry in xunji.get("training", []) if isinstance(xunji.get("training"), list) else []:
-        if not isinstance(entry, dict):
-            continue
-        res = entry.get("res") if isinstance(entry.get("res"), dict) else {}
-        entry_date = res.get("datestr") or res.get("date") or entry.get("datestr") or entry.get("date")
-        if entry_date != day.isoformat():
-            continue
-        classified = [classify_training_split(train) for train in _day_trains(entry)]
-        return next((split for split in classified if split), None)
-    return None
-
-
-def rolling_split_state(xunji: dict[str, Any], today: date, current: str | None, processed_date: str | None) -> dict[str, Any]:
-    selected = current if current in SPLIT_ORDER else SPLIT_ORDER[0]
-    source_day = today - timedelta(days=1)
-    if processed_date == source_day.isoformat():
-        return {"recommended": selected, "advanced": False, "source_date": source_day.isoformat()}
-    completed = completed_split_for_day(xunji, source_day)
-    if not completed:
-        return {"recommended": selected, "advanced": False, "source_date": None}
-    following = SPLIT_ORDER[(SPLIT_ORDER.index(completed) + 1) % len(SPLIT_ORDER)]
-    return {"recommended": following, "advanced": True, "source_date": source_day.isoformat(), "completed": completed}
-
-
-def today_recommendation(today: date, split: str) -> str:
-    weekday = "周" + "一二三四五六日"[today.weekday()]
-    fixed = initial_week_plan().get(weekday)
-    template = training_plan_brief(strength_template_plan(split), include_warmup=False)
-    if fixed:
-        return f"{fixed['name']}（可选）；若不参加，可休息或参考滚动模板：{template}"
-    return f"滚动模板参考：{template}；可按恢复情况选择训练或休息"
-
-
 def training_plan_brief(plan: dict[str, Any], include_warmup: bool = True) -> str:
     parts = [str(plan.get("name", "训练"))]
     if include_warmup and plan.get("warmup"):
@@ -519,34 +500,20 @@ def training_plan_brief(plan: dict[str, Any], include_warmup: bool = True) -> st
     return "；".join(parts)
 
 
-def next_week_training_plan(split: str) -> str:
-    selected = split if split in SPLIT_ORDER else SPLIT_ORDER[0]
-    plan = strength_template_plan(selected)
-    following = SPLIT_ORDER[(SPLIT_ORDER.index(selected) + 1) % len(SPLIT_ORDER)]
-    items = "、".join(plan["items"])
-    return (
-        f"目标2–3次：首个可训练日完成{plan['name']}部滚动训练（{items}，{plan['intensity']}）；"
-        f"完成并记录后，下次独立力量轮到{'背' if following == '背加臂' else following}。"
-        "周四胸背课可选；周末游泳与BODY PUMP二选一，至少保留1个完整休息日"
-    )
+def weekly_template_context() -> str:
+    return "现有模板库：" + "、".join(stable_training_templates()) + "；仅供动作选择，不设滚动顺序"
 
 
-def weekly_template_context(split: str) -> str:
-    selected = split if split in SPLIT_ORDER else SPLIT_ORDER[0]
-    return f"当前{selected}模板：" + "、".join(stable_training_templates()[selected])
-
-
-def split_weekly_advice(value: str, split: str) -> tuple[str, str]:
-    selected = split if split in SPLIT_ORDER else SPLIT_ORDER[0]
+def split_weekly_advice(value: str) -> tuple[str, str]:
     marker = re.search(r"模板(?:判断|建议)：", value)
     if marker:
         analysis = value[:marker.start()].strip(" ；")
         decision = value[marker.end():].strip(" ；")
         if decision:
             if decision.startswith("保持当前模板"):
-                decision = decision.replace("保持当前模板", f"保持当前{selected}模板", 1)
+                decision = decision.replace("保持当前模板", "保持现有模板库", 1)
             return analysis, decision
-    fallback = f"保持当前{selected}模板；本周缺少连续负荷、完成次数和RPE证据，先按下周计划执行并完整记录后再判断"
+    fallback = "保持现有模板库；本周缺少连续负荷、完成次数和RPE证据，先按下周建议训练并完整记录后再判断"
     return value, fallback
 
 
@@ -648,6 +615,16 @@ def _safe_source_name(name: str) -> str:
     return cleaned[:100] or "source"
 
 
+def _hash_named_source(name: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{32,}", Path(name).stem, re.IGNORECASE))
+
+
+def _knowledge_source_name(original_name: str, title: str, record_date: str, digest: str) -> str:
+    original = Path(original_name)
+    readable_stem = title if _hash_named_source(original_name) else original.stem
+    return f"{record_date}-{_safe_source_name(readable_stem)}-{digest[:10]}{original.suffix.lower()}"
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -656,23 +633,31 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _store_knowledge_source(path: Path, record_date: str) -> dict[str, Any]:
+def _store_knowledge_source(path: Path, record_date: str, title: str) -> dict[str, Any]:
     source = path.expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"knowledge source not found: {source}")
     digest = _file_sha256(source)
+    desired_name = _knowledge_source_name(source.name, title, record_date, digest)
     with db() as conn:
         existing = conn.execute(
             "select stored_name,original_name,size_bytes from knowledge_sources where sha256=?", (digest,)
         ).fetchone()
     if existing:
+        if re.search(r"(?i)(?:^|[-_])[0-9a-f]{32,}(?:[-_.]|$)", existing[0]):
+            old_path, new_path = KNOWLEDGE_SOURCES_DIR / existing[0], KNOWLEDGE_SOURCES_DIR / desired_name
+            if old_path.is_file() and old_path != new_path and not new_path.exists():
+                old_path.rename(new_path)
+            if new_path.is_file():
+                with db() as conn:
+                    conn.execute("update knowledge_sources set stored_name=? where sha256=?", (desired_name, digest))
+                existing = (desired_name, existing[1], existing[2])
         return {"sha256": digest, "stored_name": existing[0], "original_name": existing[1], "size_bytes": existing[2]}
     KNOWLEDGE_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
-    if source.parent == KNOWLEDGE_SOURCES_DIR.resolve():
-        stored_name = source.name
-    else:
-        stored_name = f"{record_date}-{digest[:10]}-{_safe_source_name(source.name)}"
-        shutil.copy2(source, KNOWLEDGE_SOURCES_DIR / stored_name)
+    stored_name = desired_name
+    destination = KNOWLEDGE_SOURCES_DIR / stored_name
+    if source != destination.resolve():
+        shutil.copy2(source, destination)
     with db() as conn:
         conn.execute(
             "insert or ignore into knowledge_sources(sha256,stored_name,original_name,size_bytes,added_at) values(?,?,?,?,?)",
@@ -804,7 +789,10 @@ def render_knowledge_document() -> Path:
                 lines.append("| " + " | ".join(_markdown_cell(item) for item in (name, shown, unit, reference_range, abnormal, page)) + " |")
             lines.append("")
         if source_hashes:
-            labels = [source_lookup[item]["original_name"] for item in source_hashes if item in source_lookup]
+            labels = [
+                source_lookup[item]["stored_name"] if _hash_named_source(source_lookup[item]["original_name"]) else source_lookup[item]["original_name"]
+                for item in source_hashes if item in source_lookup
+            ]
             coverage = body.get("pages_processed")
             page_count = body.get("page_count")
             detail = "、".join(labels) or "本地原件"
@@ -936,7 +924,7 @@ def add_knowledge(path: Path, source_id: str, extra_sources: list[Path], no_sync
     if not any((body["facts"], body["analysis"], metrics)):
         raise ValueError("knowledge entry needs facts, analysis, or metrics")
     raw_sources = [Path(item) for item in _text_list(payload.get("source_files"))] + extra_sources
-    source_records = [_store_knowledge_source(item, record_date) for item in raw_sources]
+    source_records = [_store_knowledge_source(item, record_date, title) for item in raw_sources]
     source_hashes = list(dict.fromkeys(item["sha256"] for item in source_records))
     stable_payload = {**payload, "source_files": source_hashes}
     entry_id = request_id("knowledge", source_id, stable_payload)
@@ -1090,7 +1078,7 @@ def xunji_snapshot(day: date, weekly: bool = False) -> dict[str, Any]:
         except Exception as exc:
             result[name] = {"error": str(exc)}
     training = []
-    for offset in range(14 if weekly else 2):
+    for offset in range(14 if weekly else 7):
         target = day - timedelta(days=offset)
         try:
             training.append(
@@ -1272,6 +1260,7 @@ MI_CARDIO = {
     "outdoor_hiking": ("快走", "walking", "徒步"),
     "cycling": ("动感单车（有氧）", "cycling", "骑行"),
     "outdoor_cycling": ("动感单车（有氧）", "cycling", "骑行"),
+    "outdoor_riding": ("动感单车（有氧）", "cycling", "户外骑行"),
     "elliptical": ("椭圆机", "general", "椭圆机"),
     "rowing": ("划船机", "general", "划船机"),
     "jump_rope": ("跳绳", "jumpRope", "跳绳"),
@@ -1311,6 +1300,106 @@ def workout_brief(mi: dict[str, Any], day: date, free_label: str = "自由活动
             details.append(f"心率{average:.0f}/{maximum:.0f}" if isinstance(maximum, (int, float)) else f"均心{average:.0f}")
         parts.append(label + " " + (" · ".join(details) if details else "数据不完整"))
     return "；".join(parts) if parts else "暂无"
+
+
+def daily_training_recommendation(today: date, mi: dict[str, Any], xunji: dict[str, Any]) -> str:
+    """Recommend a project from recent load and recovery, never an action list."""
+    yesterday = today - timedelta(days=1)
+    cache = mi_cache_overview(yesterday)
+    sleep = cache.get("sleep", {}).get("time_asleep_minutes") or cache.get("sleep", {}).get("duration_minutes")
+    resting = cache.get("heart", {}).get("resting_bpm")
+    prior_resting = [
+        value
+        for offset in range(2, 7)
+        if isinstance(value := mi_cache_overview(today - timedelta(days=offset)).get("heart", {}).get("resting_bpm"), (int, float))
+    ]
+    elevated_resting = isinstance(resting, (int, float)) and prior_resting and resting > sum(prior_resting) / len(prior_resting) + 8
+    if (isinstance(sleep, (int, float)) and sleep < 360) or elevated_resting:
+        reason = "睡眠不足" if isinstance(sleep, (int, float)) and sleep < 360 else "静息心率较近期基线偏高"
+        return f"建议休息或轻松步行/拉伸，保持低强度；{reason}，今天优先恢复"
+
+    workouts = mi.get("data", {}).get("query_workouts", {}).get("data", {}).get("workouts", [])
+    recent_workouts = [
+        workout for workout in workouts
+        if isinstance(workout, dict)
+        and (record_day := _record_date(workout.get("start_at")))
+        and today - timedelta(days=7) <= record_day < today
+    ]
+    yesterday_minutes = sum(
+        float(workout.get("duration_minutes", 0) or 0)
+        for workout in recent_workouts
+        if _record_date(workout.get("start_at")) == yesterday and isinstance(workout.get("duration_minutes"), (int, float))
+    )
+    if yesterday_minutes >= 60:
+        return f"建议恢复性活动或休息，保持低强度；昨日运动约{yesterday_minutes:.0f}分钟，先观察疲劳和酸痛"
+
+    latest_split: dict[str, date] = {}
+    for entry in xunji.get("training", []) if isinstance(xunji.get("training"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        res = entry.get("res") if isinstance(entry.get("res"), dict) else {}
+        entry_day = _record_date(res.get("datestr") or res.get("date") or entry.get("datestr") or entry.get("date"))
+        if not entry_day or not today - timedelta(days=7) <= entry_day < today:
+            continue
+        for train in _day_trains(entry):
+            if split := classify_training_split(train):
+                latest_split[split] = max(entry_day, latest_split.get(split, entry_day))
+
+    fixed = initial_week_plan().get("周" + "一二三四五六日"[today.weekday()])
+    recent_labels = [
+        MI_CARDIO.get(str(workout.get("activity_type")), ("", "", str(workout.get("activity_type") or "运动")))[2]
+        for workout in recent_workouts
+    ]
+    recent_context = "、".join(dict.fromkeys(recent_labels[-3:])) or "无高负荷运动"
+    if fixed:
+        name = str(fixed["name"]).split("（", 1)[0]
+        return f"建议{name}或休息，强度中等；结合近7天的{recent_context}和当前恢复情况决定是否参加"
+
+    selected = min(SPLIT_ORDER, key=lambda split: latest_split.get(split, date.min))
+    label = "背部加手臂" if selected == "背加臂" else selected
+    return f"建议{label}力量训练，强度中等；近7天该方向记录较少，近期运动以{recent_context}为主"
+
+
+def next_week_training_plan(mi: dict[str, Any], xunji: dict[str, Any], next_day: date) -> str:
+    first = daily_training_recommendation(next_day, mi, xunji).split("；", 1)[0].removeprefix("建议")
+    return (
+        f"目标2–3次：首个可训练日优先{first}；另安排1次近期覆盖较少的力量方向；"
+        "周四胸背课可选，周末游泳与BODY PUMP按恢复情况任选1项，至少保留1个完整休息日。"
+        "动作从模板库选择，不自动推进顺序"
+    )
+
+
+def weekly_workout_breakdown(workouts: list[dict[str, Any]]) -> str:
+    grouped: dict[str, dict[str, float]] = {}
+    for workout in workouts:
+        activity_type = str(workout.get("activity_type") or "未分类运动")
+        label = MI_CARDIO.get(activity_type, ("", "", "自由训练" if activity_type == "free_training" else activity_type))[2]
+        values = grouped.setdefault(label, {"count": 0, "minutes": 0, "distance": 0, "calories": 0})
+        values["count"] += 1
+        for key, target in (("duration_minutes", "minutes"), ("distance_m", "distance"), ("calories_kcal", "calories")):
+            if isinstance(workout.get(key), (int, float)):
+                values[target] += float(workout[key])
+    parts = []
+    for label, values in grouped.items():
+        details = [f"{values['count']:.0f}次", f"{values['minutes']:.0f}分钟"]
+        if values["distance"]:
+            details.append(f"{values['distance'] / 1000:.1f}km")
+        if values["calories"]:
+            details.append(f"{values['calories']:.0f}kcal")
+        parts.append(label + " " + "/".join(details))
+    return "、".join(parts) if parts else "暂无"
+
+
+def weekly_xunji_projects(training_days: list[dict[str, Any]]) -> str:
+    projects: dict[str, int] = {}
+    for entry in training_days:
+        for train in _day_trains(entry):
+            title = next((str(train[key]).strip() for key in ("name", "trainName", "title") if train.get(key)), "")
+            if not title and (split := classify_training_split(train)):
+                title = ("背部加手臂" if split == "背加臂" else split) + "力量"
+            title = title or "未命名训练"
+            projects[title] = projects.get(title, 0) + 1
+    return "、".join(f"{name}{count}次" for name, count in projects.items()) if projects else "暂无"
 
 
 def _epoch_ms(value: str) -> int:
@@ -1565,7 +1654,7 @@ def yesterday_completion(xunji: dict[str, Any]) -> str:
     return f"{projects} · {completed}/{len(sets)} 组（{round(completed / len(sets) * 100)}%）"
 
 
-def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recommended_split: str = "腿") -> list[str]:
+def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date) -> list[str]:
     summary_day = today - timedelta(days=1)
     cache = mi_cache_overview(summary_day)
     activity = cache["activity"] if _record_date(cache["activity"].get("date")) == summary_day else {}
@@ -1595,7 +1684,7 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date, recomm
     free_label = "力量训练手环数据" if completion not in ("无记录", "无训练记录") else summary_plan["name"] if summary_plan else "自由活动"
     today_training = training_brief(xunji)
     if today_training == "今日暂无训练记录":
-        today_training = today_recommendation(today, recommended_split)
+        today_training = daily_training_recommendation(today, mi, xunji)
     lines = [
         f"活动热量：{active_kcal:.0f} kcal" if isinstance(active_kcal, (int, float)) else "活动热量：暂无",
         f"步数：{steps if steps is not None else '暂无'} 步" if steps is not None else "步数：暂无",
@@ -1709,6 +1798,7 @@ def weekly_summary(mi: dict[str, Any], xunji: dict[str, Any], start: date, end: 
         delta = xunji_sessions - previous_xunji_sessions
         workout_comparison += "，训记较上周项数持平" if delta == 0 else f"，训记较上周{'增加' if delta > 0 else '减少'}{abs(delta)}项"
     lines.append(f"训练：小米记录{len(workouts)}次/{workout_minutes:.0f}分钟，训记记录{xunji_sessions}项{workout_comparison}")
+    lines.append(f"运动项目：小米 {weekly_workout_breakdown(workouts)}；训记 {weekly_xunji_projects(training_days[:7])}")
     calories, protein, carbs, fat = (diet_average(diet_totals, field) for field in ("totalCal", "totalProtein", "totalCarb", "totalFat"))
     previous_nutrition = {
         field: diet_average(previous_diet_totals, field)
@@ -1735,7 +1825,7 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
             "结合本周事实和可用环比，用恢复、训练、营养三个标签各写1至2句，最后必须再写模板判断，总计不超过360个汉字；"
             "不用Markdown标题或列表。解释最重要变化、风险或缺口及依据，不要把原始数据换个说法重复。"
             "下周训练安排已由程序给出，不得用泛泛的‘按计划推进’替代分析。"
-            "最后严格二选一：证据不足时写‘模板判断：保持当前模板；理由…’；"
+            "最后严格二选一：证据不足时写‘模板判断：保持现有模板库；理由…’；"
             "只有连续训练证据明确支持时，才写‘模板建议：把“原动作或组次”改为“新动作或组次”；理由…；待确认’，"
             "不得表述为已修改，也不得省略具体差异。"
         )
@@ -1744,7 +1834,7 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
             "结合昨日状态和今日安排，只给1至2句、不超过120个汉字的行动建议。"
             "必须先综合权衡身体变化、睡眠与恢复、活动、训练完成度和饮食数据，再保留最重要的1至2个结论；"
             "不设分项标题，不机械复述summary中的数据和今日训练内容。"
-            "训练动作必须沿用今日参考模板，不得新增或替换训练动作；确需调整时只建议减量或休息。"
+            "今日训练项目已由程序根据近7天运动与恢复数据生成；不得改成其他项目，不得列具体动作、组数或次数，只能补充强度、恢复或休息建议。"
         )
     return (
         "请以专业健身教练和营养师的综合视角，根据下面聚合数据给出中文建议，不做医疗诊断。"
@@ -1755,8 +1845,8 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
     )
 
 
-DAILY_FALLBACK_ADVICE = "按今日模板量力训练；优先补足睡眠、蛋白质和饮水，疲劳明显则减量或休息。"
-WEEKLY_FALLBACK_ADVICE = "恢复：按本周睡眠与静息心率继续观察，异常不只看单日。训练：执行卡片中的2–3次具体安排并记录重量、次数和RPE。营养：至少记录6天，再按目标检查蛋白质与总热量。模板判断：保持当前模板；缺少连续负荷与完成度证据。"
+DAILY_FALLBACK_ADVICE = "按今日推荐项目量力训练；优先补足睡眠、蛋白质和饮水，疲劳明显则减量或休息。"
+WEEKLY_FALLBACK_ADVICE = "恢复：按本周睡眠与静息心率继续观察，异常不只看单日。训练：执行卡片中的2–3次项目安排并记录负荷和RPE。营养：至少记录6天，再按目标检查蛋白质与总热量。模板判断：保持现有模板库；缺少连续负荷与完成度证据。"
 
 
 def command_available(value: str | None) -> bool:
@@ -1855,9 +1945,8 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     if last == today and not force:
         return 0
     missed = missing_dates(last, today)
-    mi = mi_snapshot(config, 1)
+    mi = mi_snapshot(config, 6)
     xunji = xunji_snapshot(today)
-    split_state = rolling_split_state(xunji, today, meta_get("next_strength_template"), meta_get("last_split_training_date"))
     sync_status = "dry_run" if dry_run else "none"
     if not dry_run:
         try:
@@ -1866,7 +1955,7 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
             sync_status = f"error:{type(exc).__name__}"
     if missed and not dry_run:
         send_report(config, "补发日报", [f"电脑关闭期间缺少 {len(missed)} 天日报", f"日期：{missed[0]} 至 {missed[-1]}", "数据已在本次启动后重新同步"], request_id("catchup", today.isoformat(), [str(d) for d in missed]))
-    lines = local_summary(mi, xunji, today, split_state["recommended"])
+    lines = local_summary(mi, xunji, today)
     body_change = body_change_summary(mi_body_history(), meta_get("last_body_measurement"))
     if body_change:
         lines.extend(["身体变化：" + body_change["detail"], "身体分析：" + body_change["analysis"]])
@@ -1882,9 +1971,6 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     if not send_report(config, title, lines, request_id("daily", today.isoformat(), lines), progress):
         return 2
     meta_set("last_daily", today.isoformat())
-    if split_state["advanced"]:
-        meta_set("next_strength_template", split_state["recommended"])
-        meta_set("last_split_training_date", split_state["source_date"])
     if body_change:
         meta_set("last_body_measurement", body_change["timestamp"])
     return 0
@@ -1902,13 +1988,9 @@ def run_weekly(dry_run: bool = False) -> int:
         xunji = xunji_snapshot(period_end, weekly=True)
         title = f"健身周报 · {period_start.month}月{period_start.day}日—{period_end.month}月{period_end.day}日"
         facts = weekly_summary(mi, xunji, period_start, period_end)
-        next_split = meta_get("next_strength_template")
-        next_split = next_split if next_split in SPLIT_ORDER else SPLIT_ORDER[0]
-        next_plan = next_week_training_plan(next_split)
-        context = [*facts, "下周训练：" + next_plan, weekly_template_context(next_split)]
-        analysis, template_decision = split_weekly_advice(
-            model_advice(config, mi, xunji, weekly=True, context=context), next_split
-        )
+        next_plan = next_week_training_plan(mi, xunji, period_end + timedelta(days=1))
+        context = [*facts, "下周训练：" + next_plan, weekly_template_context()]
+        analysis, template_decision = split_weekly_advice(model_advice(config, mi, xunji, weekly=True, context=context))
         lines = [
             f"周期：{period_start.isoformat()} 至 {period_end.isoformat()}",
             *facts,
@@ -1949,7 +2031,11 @@ def run_meal_reminder(dry_run: bool = False) -> int:
 
 def write_food(path: Path, source_id: str) -> int:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    foods = normalize_food_units(payload.get("foods", []))
+    try:
+        foods = normalize_food_meal_types(normalize_food_units(payload.get("foods", [])))
+    except ValueError as exc:
+        print(f"餐次无效：{exc}；未写入。")
+        return 3
     if not foods or not all(diet_auto_allowed(food) and food.get("ntr") for food in foods):
         print("需要明确餐次、食物、数量、单位和营养估算；未写入。")
         return 3
@@ -1999,11 +2085,10 @@ def doctor() -> int:
 
 def plan_preview() -> str:
     preview = {
-        "mode": "rolling_reference",
-        "order": list(SPLIT_ORDER),
+        "mode": "template_library",
         "templates": {split: strength_template_plan(split) for split in stable_training_templates()},
         "fixed_activities": initial_week_plan(),
-        "rule": "仅完成独立力量训练后推进；固定活动和漏练不推进；模板修改需确认",
+        "rule": "模板仅供参考；日报依据近7天训练、活动和恢复推荐项目，不自动推进顺序",
     }
     text = json.dumps(preview, ensure_ascii=False, indent=2)
     print(text)
@@ -2023,7 +2108,6 @@ def self_check(data_dir: Path) -> int:
     assert STATE_PATH == data_dir.resolve() / "private.db"
     with patch.dict(os.environ, {"BODY_FITNESS_DATA_DIR": ""}):
         assert _default_data_dir() == DEFAULT_DATA_DIR.resolve()
-    assert "热身" not in today_recommendation(date(2026, 10, 10), "胸")
     print("self-check: private-db-path ok")
     original = DATA_DIR
     with tempfile.TemporaryDirectory(prefix="body coach migration ") as temp:
@@ -2054,7 +2138,7 @@ def self_check(data_dir: Path) -> int:
     with tempfile.TemporaryDirectory(prefix="body knowledge ") as temp:
         root = Path(temp)
         set_data_dir(root / "private")
-        source = root / "report.pdf"
+        source = root / (("a" * 64) + ".pdf")
         source.write_bytes(b"%PDF-1.4\n% self-check only\n")
         first_payload = root / "first.json"
         first_payload.write_text(
@@ -2086,6 +2170,8 @@ def self_check(data_dir: Path) -> int:
         assert len(found) == 2 and any("3.1 → 3.4" in item for item in found[0]["comparison"])
         with db() as conn:
             assert conn.execute("select count(*) from knowledge_sources").fetchone()[0] == 1
+            stored_name = conn.execute("select stored_name from knowledge_sources").fetchone()[0]
+        assert "首次化验" in stored_name and ("a" * 32) not in stored_name
         meta_set("training_manual_lark_doc", "https://example.feishu.cn/docx/manual")
         document = render_knowledge_document().read_text(encoding="utf-8")
         assert "[打开飞书文档](https://example.feishu.cn/docx/manual)" in document
@@ -2109,6 +2195,13 @@ def self_check(data_dir: Path) -> int:
     assert weekly_period(date(2026, 10, 12)) == (date(2026, 10, 5), date(2026, 10, 11))
     assert pending_week_ends(None, date(2026, 10, 11)) == [date(2026, 10, 11)]
     assert pending_week_ends(date(2026, 9, 27), date(2026, 10, 11)) == [date(2026, 10, 4), date(2026, 10, 11)]
+    meals = normalize_food_meal_types([{"meal_type": "早餐"}, {"meal_type": "午餐"}, {"meal_type": "晚餐"}])
+    assert [item["meal_type"] for item in meals] == ["breakfast", "lunch", "dinner"]
+    try:
+        normalize_food_meal_types([{"meal_type": "早午餐"}])
+        raise AssertionError("unknown meal type must be rejected")
+    except ValueError:
+        pass
     assert "subtitle" not in report_card("健身日报 · 10月11日", [])["header"]
     daily_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["已校验汇总"])
     weekly_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, weekly=True, context=["趋势汇总"])
@@ -2120,17 +2213,23 @@ def self_check(data_dir: Path) -> int:
         "heart": {"resting_bpm": 60},
         "body": {},
     }
-    fake_mi = {"status": "ok", "data": {"query_workouts": {"data": {"workouts": [{"start_at": "2026-10-06T18:00:00+08:00", "duration_minutes": 60}]}}}}
+    fake_mi = {"status": "ok", "data": {"query_workouts": {"data": {"workouts": [{"workout_id": "ride-1", "activity_type": "outdoor_riding", "start_at": "2026-10-06T18:00:00+08:00", "duration_minutes": 60, "distance_m": 15000, "calories_kcal": 420}]}}}}
     fake_diet = {"res": {"days": [{"date": "2026-10-05", "totals": {"totalCal": 2000, "totalProtein": 150, "totalCarb": 220, "totalFat": 60}}]}}
     with patch(__name__ + ".mi_cache_overview", return_value=fake_week):
         week = weekly_summary(fake_mi, {"training": [], "diet": fake_diet}, date(2026, 10, 5), date(2026, 10, 11))
     assert "活动：活动记录7天，日均步数8000，较上周持平，活动热量合计2800kcal，距离合计42.0km" in week
     assert "训练：小米记录1次/60分钟，训记记录0项，小米较上周增加1次" in week
+    assert "运动项目：小米 户外骑行 1次/60分钟/15.0km/420kcal；训记 暂无" in week
     assert "营养：记录1天，日均热量2000kcal，日均蛋白质150g，日均碳水220g，日均脂肪60g" in week
-    plan = next_week_training_plan("腿")
-    assert "倒蹬3×10–12" in plan and "周末游泳与BODY PUMP二选一" in plan and "轮到肩" in plan
-    analysis, decision = split_weekly_advice("恢复：稳定。模板判断：保持当前模板；证据不足。", "腿")
-    assert analysis == "恢复：稳定。" and decision.startswith("保持当前腿模板")
+    with patch(__name__ + ".mi_cache_overview", return_value=fake_week):
+        recommendation = daily_training_recommendation(date(2026, 10, 14), fake_mi, {"training": []})
+        plan = next_week_training_plan(fake_mi, {"training": []}, date(2026, 10, 12))
+    assert "力量训练" in recommendation and "×" not in recommendation and "组" not in recommendation
+    assert "周末游泳与BODY PUMP" in plan and "动作从模板库选择" in plan and "轮到" not in plan
+    assert "户外骑行 60分钟" in workout_brief(fake_mi, date(2026, 10, 6))
+    assert mi_workouts_for_day(fake_mi, date(2026, 10, 6))[0]["activity_type"] == "outdoor_riding"
+    analysis, decision = split_weekly_advice("恢复：稳定。模板判断：保持当前模板；证据不足。")
+    assert analysis == "恢复：稳定。" and decision.startswith("保持现有模板库")
     weekly_card = report_card("健身周报", ["下周训练：" + plan, "模板判断：" + decision, "教练分析：恢复：稳定。"])
     assert any("下周执行方案" in json.dumps(element, ensure_ascii=False) for element in weekly_card["body"]["elements"])
     print("self-check: report-period-and-prompt ok")
@@ -2183,7 +2282,7 @@ def self_check(data_dir: Path) -> int:
         assert run_daily(force=True, dry_run=True) == 0
         assert run_weekly(dry_run=True) == 0
         assert run_meal_reminder(dry_run=True) == 0
-        assert mi_mock.call_args_list[0].args[1] == 1
+        assert mi_mock.call_args_list[0].args[1] == 6
         assert mi_mock.call_args_list[1].args[1] == 13
     print("self-check: report-dry-run ok")
     return 0
