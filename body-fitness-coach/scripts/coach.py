@@ -1860,8 +1860,17 @@ def weekly_summary(mi: dict[str, Any], xunji: dict[str, Any], start: date, end: 
     return lines
 
 
+def yesterday_trained(context: list[str] | None) -> bool:
+    missing = {"暂无", "无记录", "无训练记录"}
+    return any(
+        line.split("：", 1)[1].strip() not in missing
+        for line in context or []
+        if line.startswith(("昨日运动：", "昨日完成：")) and "：" in line
+    )
+
+
 def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = False, context: list[str] | None = None) -> str:
-    payload = {"summary": context or [], "weekly": weekly}
+    payload = {"summary": context or [], "weekly": weekly, "yesterday_trained": yesterday_trained(context) if not weekly else False}
     if weekly:
         format_rule = (
             "结合本周事实和可用环比，用恢复、训练、营养三个标签各写1至2句，最后必须再写模板判断，总计不超过360个汉字；"
@@ -1873,8 +1882,10 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
         )
     else:
         format_rule = (
-            "结合昨日状态和今日安排，只给1至2句、不超过120个汉字的行动建议。"
-            "必须先综合权衡身体变化、睡眠与恢复、活动、训练完成度和饮食数据，再保留最重要的1至2个结论；"
+            "结合昨日状态和今日安排给出行动建议。若yesterday_trained为true，写2至3句、不超过220个汉字："
+            "先根据可用的项目、时长、心率、训练量和完成度评价昨日训练的负荷、刺激或质量，再结合睡眠、静息心率、活动和饮食判断恢复，最后给出今天的强度、训练量或恢复方向；"
+            "若yesterday_trained为false，只给1至2句、不超过120个汉字。"
+            "必须综合权衡身体变化、睡眠与恢复、活动、训练完成度和饮食数据；"
             "不设分项标题，不机械复述summary中的数据和今日训练内容。"
             "今日训练项目已由程序根据近7天运动与恢复数据生成；不得改成其他项目，不得列具体动作、组数或次数，只能补充强度、恢复或休息建议。"
         )
@@ -1888,6 +1899,7 @@ def advice_prompt(mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = Fals
 
 
 DAILY_FALLBACK_ADVICE = "按今日推荐项目量力训练；优先补足睡眠、蛋白质和饮水，疲劳明显则减量或休息。"
+DAILY_TRAINING_FALLBACK_ADVICE = "昨日训练已形成有效刺激；今天结合睡眠、静息心率和酸痛判断恢复，状态正常可按推荐项目保持中等强度，疲劳明显则减量或休息。"
 WEEKLY_FALLBACK_ADVICE = "恢复：按本周睡眠与静息心率继续观察，异常不只看单日。训练：执行卡片中的2–3次项目安排并记录负荷和RPE。营养：至少记录6天，再按目标检查蛋白质与总热量。模板判断：保持现有模板库；缺少连续负荷与完成度证据。"
 
 
@@ -1938,7 +1950,8 @@ def trim_advice(value: str, limit: int) -> str:
 
 
 def model_advice(config: dict[str, Any], mi: dict[str, Any], xunji: dict[str, Any], weekly: bool = False, context: list[str] | None = None) -> str:
-    fallback = WEEKLY_FALLBACK_ADVICE if weekly else DAILY_FALLBACK_ADVICE
+    trained = yesterday_trained(context) if not weekly else False
+    fallback = WEEKLY_FALLBACK_ADVICE if weekly else DAILY_TRAINING_FALLBACK_ADVICE if trained else DAILY_FALLBACK_ADVICE
     if not config.get("model_analysis") or not command_available(config.get("codex_cli")):
         return fallback
     prompt = advice_prompt(mi, xunji, weekly, context)
@@ -1954,7 +1967,7 @@ def model_advice(config: dict[str, Any], mi: dict[str, Any], xunji: dict[str, An
                 answer = output.read_text(encoding="utf-8").strip()
                 if answer:
                     meta_set("last_model_error", "")
-                    return trim_advice(answer, 360 if weekly else 120)
+                    return trim_advice(answer, 360 if weekly else 220 if trained else 120)
             record_model_error("process_failed", exit_code=completed.returncode, output_present=output.exists(), detail=completed.stderr)
         except subprocess.TimeoutExpired:
             record_model_error("timeout")
@@ -2254,9 +2267,13 @@ def self_check(data_dir: Path) -> int:
     assert sleep_asleep_minutes({"duration_minutes": 464, "time_asleep_minutes": 464, "stages": '[{"stage":"light","minutes":464}]'}) == 464
     assert "subtitle" not in report_card("健身日报 · 10月11日", [])["header"]
     daily_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["已校验汇总"])
+    trained_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["昨日运动：户外骑行 60分钟", "昨日完成：无训练记录"])
     weekly_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, weekly=True, context=["趋势汇总"])
     assert '"mi"' not in daily_prompt and '"xunji"' not in daily_prompt
     assert '"mi"' not in weekly_prompt and '"xunji"' not in weekly_prompt
+    assert not yesterday_trained(["昨日运动：暂无", "昨日完成：无训练记录"])
+    assert yesterday_trained(["昨日运动：户外骑行 60分钟", "昨日完成：无训练记录"])
+    assert '"yesterday_trained": true' in trained_prompt
     fake_week = {
         "activity": {"steps": 8000, "active_kcal": 400, "distance_m": 6000},
         "sleep": {"time_asleep_minutes": 450},
