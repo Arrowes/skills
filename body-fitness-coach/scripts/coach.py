@@ -33,6 +33,10 @@ DEFAULT_DATA_DIR = SKILL_ROOT / ".private"
 KEYRING_SERVICE = "body-coach"
 TOKEN_RE = re.compile(r"xj(?:llm|tpl|food|body)_[A-Za-z0-9_-]+")
 SEARCH_KEY_RE = re.compile(r"Bearer\s+([a-f0-9]{32,})")
+XUNJI_TARGET_LOOKBACK_DAYS = 90
+MODEL_ANALYSIS_TIMEOUT_SECONDS = 180
+MODEL_ANALYSIS_ATTEMPTS = 2
+DAILY_REPORT_NOT_BEFORE = (9, 30)
 
 
 def _default_data_dir() -> Path:
@@ -278,6 +282,7 @@ def report_card(
     template: str = "blue",
     daily_progress: list[dict[str, Any]] | None = None,
     subtitle: str | None = None,
+    resend_date: date | None = None,
 ) -> dict[str, Any]:
     parsed = {line.split("：", 1)[0]: line.split("：", 1)[1] for line in lines if "：" in line}
     elements: list[dict[str, Any]] = []
@@ -403,6 +408,18 @@ def report_card(
         )
     if not elements:
         elements.append({"tag": "markdown", "content": "\n".join(f"- {line}" for line in lines)})
+    if resend_date:
+        elements.append(
+            {
+                "tag": "button",
+                "type": "primary_filled",
+                "width": "fill",
+                "text": {"tag": "plain_text", "content": "同步后重发日报"},
+                "behaviors": [
+                    {"type": "callback", "value": {"cmd": f"bodycoach.resend.{resend_date:%Y%m%d}"}}
+                ],
+            }
+        )
     header: dict[str, Any] = {
         "title": {"tag": "plain_text", "content": title},
         "template": template,
@@ -1053,16 +1070,23 @@ def mi_snapshot(config: dict[str, Any], days: int = 7, end: date | None = None) 
         return {"status": "error", "error": type(exc).__name__}
 
 
+def xunji_food_query_payload(day: date) -> dict[str, Any]:
+    # Xunji currently stores a configured target on older dated food rows while
+    # newer API-created rows may expose zero limits. Keep a bounded target window.
+    return {
+        "start_date": (day - timedelta(days=XUNJI_TARGET_LOOKBACK_DAYS)).isoformat(),
+        "end_date": day.isoformat(),
+        "include_detail": True,
+    }
+
+
 def xunji_snapshot(day: date, weekly: bool = False) -> dict[str, Any]:
-    # Keep enough history to recover the latest non-zero nutrition target when
-    # Xunji returns zero limits for a day that has standalone food records.
-    start = day - timedelta(days=13 if weekly else 6)
     result: dict[str, Any] = {}
     calls = [
         (
             "diet",
             "https://eatings.xunjiapp.cn/open/food/query_gzip",
-            {"start_date": start.isoformat(), "end_date": day.isoformat(), "include_detail": True},
+            xunji_food_query_payload(day),
             "xunji_diet_key",
         ),
         (
@@ -1124,7 +1148,7 @@ def compact_data(data: Any, depth: int = 0) -> Any:
 
 
 def sleep_asleep_minutes(sleep: dict[str, Any]) -> float | None:
-    """Return actual sleep time, excluding awake stages when Xiaomi exposes them."""
+    """Return actual sleep time without trusting contradictory Xiaomi stages."""
     stages = sleep.get("stages")
     if isinstance(stages, str):
         try:
@@ -1134,14 +1158,23 @@ def sleep_asleep_minutes(sleep: dict[str, Any]) -> float | None:
     if isinstance(stages, list):
         awake_seen = False
         asleep = 0.0
+        stage_awake = 0.0
         for stage in stages:
             if not isinstance(stage, dict) or not isinstance(stage.get("minutes"), (int, float)):
                 continue
             if str(stage.get("stage", "")).lower() == "awake":
                 awake_seen = True
+                stage_awake += float(stage["minutes"])
             else:
                 asleep += float(stage["minutes"])
         if awake_seen and asleep > 0:
+            duration = sleep.get("duration_minutes")
+            summary_asleep = sleep.get("time_asleep_minutes")
+            summary_awake = sleep.get("time_awake_minutes")
+            if all(isinstance(value, (int, float)) for value in (duration, summary_asleep, summary_awake)):
+                summary_matches_duration = abs(float(summary_asleep) + float(summary_awake) - float(duration)) <= 5
+                if summary_matches_duration and abs(stage_awake - float(summary_awake)) > 5:
+                    return float(summary_asleep)
             return asleep
     duration, awake = sleep.get("duration_minutes"), sleep.get("time_awake_minutes")
     if isinstance(duration, (int, float)) and isinstance(awake, (int, float)) and awake > 0:
@@ -1156,19 +1189,15 @@ def _sleep_session(conn: sqlite3.Connection, day: date | None) -> sqlite3.Row | 
         return conn.execute(
             f"select {fields} from sleep_sessions where coalesce(is_nap,0)=0 order by end_at desc limit 1"
         ).fetchone()
-    # A day's overnight recovery normally ends the following morning. Only fall
-    # back to a same-day ending session when that following-morning record is absent.
-    for end_day in ((day + timedelta(days=1)).isoformat(), day.isoformat()):
-        row = conn.execute(
-            f"select {fields} from sleep_sessions "
-            "where substr(end_at,1,10)=? and coalesce(is_nap,0)=0 "
-            "order by case when stages like '%\"awake\"%' then 0 else 1 end, "
-            "coalesce(time_asleep_minutes,duration_minutes) desc,end_at desc limit 1",
-            (end_day,),
-        ).fetchone()
-        if row:
-            return row
-    return None
+    # A target day's overnight recovery must end the following morning. A
+    # same-day fallback would reuse the previous night's session on the next report.
+    return conn.execute(
+        f"select {fields} from sleep_sessions "
+        "where substr(end_at,1,10)=? and coalesce(is_nap,0)=0 "
+        "order by case when stages like '%\"awake\"%' then 0 else 1 end, "
+        "coalesce(time_asleep_minutes,duration_minutes) desc,end_at desc limit 1",
+        ((day + timedelta(days=1)).isoformat(),),
+    ).fetchone()
 
 
 def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
@@ -1182,7 +1211,7 @@ def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
                 sleep = _sleep_session(conn, None)
                 heart = conn.execute(
                     "select substr(timestamp,1,10) date,min(bpm) min_bpm,max(bpm) max_bpm,"
-                    "max(case when lower(sample_type) like '%rest%' then bpm end) resting_bpm "
+                    "max(case when lower(sample_type) like '%rest%' then bpm end) resting_bpm,max(timestamp) last_sample "
                     "from heart_rate_samples group by substr(timestamp,1,10) order by date desc limit 1"
                 ).fetchone()
             else:
@@ -1194,7 +1223,7 @@ def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
                 sleep = _sleep_session(conn, day)
                 heart = conn.execute(
                     "select substr(timestamp,1,10) date,min(bpm) min_bpm,max(bpm) max_bpm,"
-                    "max(case when lower(sample_type) like '%rest%' then bpm end) resting_bpm "
+                    "max(case when lower(sample_type) like '%rest%' then bpm end) resting_bpm,max(timestamp) last_sample "
                     "from heart_rate_samples where substr(timestamp,1,10)=? group by substr(timestamp,1,10)",
                     (day_text,),
                 ).fetchone()
@@ -1202,12 +1231,17 @@ def mi_cache_overview(day: date | None = None) -> dict[str, Any]:
                 "select timestamp,weight_kg,bmi,body_fat_pct,basal_metabolism_kcal "
                 "from body_measurements order by timestamp desc limit 1"
             ).fetchone()
-        return {
+        overview = {
             "activity": dict(activity) if activity else {},
             "sleep": dict(sleep) if sleep else {},
             "heart": dict(heart) if heart else {},
             "body": dict(body) if body else {},
         }
+        if day and mi_day_incomplete(overview, day):
+            overview["incomplete_last_sample"] = overview["heart"].get("last_sample")
+            overview["activity"] = {}
+            overview["heart"] = {}
+        return overview
     except Exception:
         return {"activity": {}, "sleep": {}, "heart": {}, "body": {}}
 
@@ -1288,6 +1322,17 @@ def _clock(value: Any) -> str:
         return parsed.strftime("%H:%M")
     except (TypeError, ValueError):
         return ""
+
+
+def mi_day_incomplete(overview: dict[str, Any], day: date) -> bool:
+    last_sample = overview.get("incomplete_last_sample") or overview.get("heart", {}).get("last_sample")
+    try:
+        parsed = datetime.fromisoformat(str(last_sample).replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone()
+        return parsed.date() == day and parsed.hour < 18
+    except (TypeError, ValueError):
+        return False
 
 
 MI_CARDIO = {
@@ -1507,10 +1552,11 @@ def sync_mi_workouts(mi: dict[str, Any], day: date) -> str:
 
 def daily_progress(overview: dict[str, Any], day: date | None = None) -> list[dict[str, Any]]:
     day = day or date.today()
-    activity = overview.get("activity", {}) if _record_date(overview.get("activity", {}).get("date")) == day else {}
+    incomplete = mi_day_incomplete(overview, day)
+    activity = overview.get("activity", {}) if not incomplete and _record_date(overview.get("activity", {}).get("date")) == day else {}
     sleep_date = _record_date(overview.get("sleep", {}).get("end_at"))
-    sleep = overview.get("sleep", {}) if sleep_date in (day, day + timedelta(days=1)) else {}
-    heart = overview.get("heart", {}) if _record_date(overview.get("heart", {}).get("date")) == day else {}
+    sleep = overview.get("sleep", {}) if sleep_date == day + timedelta(days=1) else {}
+    heart = overview.get("heart", {}) if not incomplete and _record_date(overview.get("heart", {}).get("date")) == day else {}
     steps = activity.get("steps")
     asleep = sleep_asleep_minutes(sleep)
     sleep_start, sleep_end = _clock(sleep.get("start_at")), _clock(sleep.get("end_at"))
@@ -1542,7 +1588,7 @@ def nutrition_targets(overview: dict[str, Any], body_override: dict[str, Any] | 
     return {"calories": calories, "protein": protein, "carbs": carbs, "fat": fat}
 
 
-def xunji_nutrition_targets(diet: dict[str, Any]) -> dict[str, int]:
+def xunji_nutrition_targets(diet: dict[str, Any], allow_cached: bool = True) -> dict[str, int]:
     days = diet.get("res", {}).get("days", []) if isinstance(diet, dict) else []
     for item in reversed(days if isinstance(days, list) else []):
         limits = item.get("foods", {}).get("limits", {}) if isinstance(item, dict) else {}
@@ -1552,7 +1598,22 @@ def xunji_nutrition_targets(diet: dict[str, Any]) -> dict[str, int]:
             continue
         if protein > 0 and carbs > 0 and fat > 0:
             return {"calories": protein * 4 + carbs * 4 + fat * 9, "protein": protein, "carbs": carbs, "fat": fat}
+    if allow_cached:
+        try:
+            cached = json.loads(meta_get("xunji_nutrition_targets") or "{}")
+            values = {key: round(float(cached[key])) for key in ("calories", "protein", "carbs", "fat")}
+            if all(value > 0 for value in values.values()):
+                return values
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     return {}
+
+
+def cache_xunji_nutrition_targets(diet: dict[str, Any]) -> dict[str, int]:
+    targets = xunji_nutrition_targets(diet, allow_cached=False)
+    if targets:
+        meta_set("xunji_nutrition_targets", json.dumps(targets, ensure_ascii=False, sort_keys=True))
+    return targets
 
 
 def xunji_diet_day(diet: dict[str, Any], day: date) -> dict[str, Any]:
@@ -1605,7 +1666,8 @@ def meal_feedback(diet: dict[str, Any], day: date, foods: list[dict[str, Any]]) 
     recent = []
     for item in diet.get("res", {}).get("days", []):
         totals = item.get("totals", {}) if isinstance(item, dict) else {}
-        if (item.get("date") or item.get("datestr")) != day.isoformat() and isinstance(totals.get("totalCal"), (int, float)):
+        item_day = _record_date(item.get("date") or item.get("datestr")) if isinstance(item, dict) else None
+        if item_day and day - timedelta(days=7) <= item_day < day and isinstance(totals.get("totalCal"), (int, float)):
             recent.append(totals)
     recent_note = "近期记录不足"
     if recent and targets:
@@ -1628,7 +1690,7 @@ def meal_feedback(diet: dict[str, Any], day: date, foods: list[dict[str, Any]]) 
     suggestions.append("加一份蔬菜")
     meal = _food_totals(foods)
     if not targets:
-        evaluation = "本餐已记录；训记暂无饮食目标，暂不判断是否超标"
+        evaluation = "本餐已记录；本次未能从训记读取饮食目标，暂不判断是否超标"
     elif meal["fat"] >= targets["fat"] * 0.4:
         evaluation = "本餐脂肪偏高；下一餐优先低脂蛋白、少油少酱"
     elif meal["calories"] >= 300 and meal["protein"] < 20:
@@ -1699,10 +1761,11 @@ def yesterday_completion(xunji: dict[str, Any]) -> str:
 def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date) -> list[str]:
     summary_day = today - timedelta(days=1)
     cache = mi_cache_overview(summary_day)
-    activity = cache["activity"] if _record_date(cache["activity"].get("date")) == summary_day else {}
+    incomplete = mi_day_incomplete(cache, summary_day)
+    activity = cache["activity"] if not incomplete and _record_date(cache["activity"].get("date")) == summary_day else {}
     sleep_date = _record_date(cache["sleep"].get("end_at"))
-    sleep_data = cache["sleep"] if sleep_date in (summary_day, today) else {}
-    heart = cache["heart"] if _record_date(cache["heart"].get("date")) == summary_day else {}
+    sleep_data = cache["sleep"] if sleep_date == today else {}
+    heart = cache["heart"] if not incomplete and _record_date(cache["heart"].get("date")) == summary_day else {}
     steps = activity.get("steps")
     active_kcal = activity.get("active_kcal")
     distance = activity.get("distance_m")
@@ -1743,6 +1806,10 @@ def local_summary(mi: dict[str, Any], xunji: dict[str, Any], today: date) -> lis
     ]
     if mi.get("status") != "ok":
         lines.append(f"小米数据：{mi.get('status', 'unknown')}")
+    elif incomplete:
+        lines.append(f"小米数据：昨日活动与心率不完整（最后记录 {_clock(cache.get('incomplete_last_sample')) or '未知'}）")
+    if not sleep_data:
+        lines.append("睡眠数据缺失：同步后回复“重发日报”")
     if _has_error(xunji):
         lines.append("训记数据：部分读取异常")
     return lines
@@ -1961,24 +2028,48 @@ def model_advice(config: dict[str, Any], mi: dict[str, Any], xunji: dict[str, An
             "exec", "--ephemeral", "--sandbox", "read-only",
             "--skip-git-repo-check", "--ignore-rules", "-C", str(ROOT), "-o", str(output), "-",
         ]
-        try:
-            completed = run_process(command, input=prompt, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=120)
-            if completed.returncode == 0 and output.exists():
-                answer = output.read_text(encoding="utf-8").strip()
-                if answer:
-                    meta_set("last_model_error", "")
-                    return trim_advice(answer, 360 if weekly else 220 if trained else 120)
-            record_model_error("process_failed", exit_code=completed.returncode, output_present=output.exists(), detail=completed.stderr)
-        except subprocess.TimeoutExpired:
-            record_model_error("timeout")
-        except Exception as exc:
-            record_model_error("exception", detail=type(exc).__name__)
+        last_reason = "process_failed"
+        last_exit_code: int | None = None
+        last_output_present = False
+        last_detail = ""
+        for _ in range(MODEL_ANALYSIS_ATTEMPTS):
+            output.unlink(missing_ok=True)
+            try:
+                completed = run_process(
+                    command, input=prompt, text=True, encoding="utf-8", errors="replace",
+                    capture_output=True, timeout=MODEL_ANALYSIS_TIMEOUT_SECONDS,
+                )
+                if completed.returncode == 0 and output.exists():
+                    answer = output.read_text(encoding="utf-8").strip()
+                    if answer:
+                        meta_set("last_model_error", "")
+                        return trim_advice(answer, 360 if weekly else 220 if trained else 120)
+                last_reason = "process_failed"
+                last_exit_code = completed.returncode
+                last_output_present = output.exists()
+                last_detail = completed.stderr
+            except subprocess.TimeoutExpired:
+                last_reason = "timeout"
+                last_exit_code = None
+                last_output_present = output.exists()
+                last_detail = ""
+            except Exception as exc:
+                last_reason = "exception"
+                last_exit_code = None
+                last_output_present = output.exists()
+                last_detail = type(exc).__name__
+        record_model_error(
+            last_reason,
+            exit_code=last_exit_code,
+            output_present=last_output_present,
+            detail=f"attempts={MODEL_ANALYSIS_ATTEMPTS} {last_detail}".strip(),
+        )
     return "模型分析暂不可用（运行 doctor 查看原因）；" + fallback
 
 
-def send_report(config: dict[str, Any], title: str, lines: list[str], identity: str, progress: list[dict[str, Any]] | None = None, subtitle: str | None = None) -> bool:
+def send_report(config: dict[str, Any], title: str, lines: list[str], identity: str, progress: list[dict[str, Any]] | None = None, subtitle: str | None = None, resend_date: date | None = None) -> bool:
     ensure_lark_channel_env()
-    card = json.dumps(report_card(title, lines, daily_progress=progress, subtitle=subtitle), ensure_ascii=False, separators=(",", ":"))
+    card = json.dumps(report_card(title, lines, daily_progress=progress, subtitle=subtitle, resend_date=resend_date), ensure_ascii=False, separators=(",", ":"))
     base = command_prefix(config["lark_cli"]) + ["im", "+messages-send", "--as", "bot", "--chat-id", config["chat_id"], "--idempotency-key", identity]
     sent = run_process(base + ["--msg-type", "interactive", "--content", card], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if sent.returncode == 0:
@@ -1992,8 +2083,18 @@ def preview_report(title: str, lines: list[str], progress: list[dict[str, Any]] 
     print(json.dumps({"dry_run": True, "title": title, "lines": lines, "progress": progress or []}, ensure_ascii=False, indent=2))
 
 
+def daily_needs_resend(lines: list[str]) -> bool:
+    return any(line.startswith(("睡眠数据缺失：", "小米数据：")) for line in lines)
+
+
+def daily_report_allowed(now: datetime, force: bool = False) -> bool:
+    return force or (now.hour, now.minute) >= DAILY_REPORT_NOT_BEFORE
+
+
 def run_daily(force: bool = False, dry_run: bool = False) -> int:
     config = load_config()
+    if not dry_run and not daily_report_allowed(datetime.now().astimezone(), force):
+        return 0
     today = date.today()
     last_raw = meta_get("last_daily")
     last = date.fromisoformat(last_raw) if last_raw else None
@@ -2004,6 +2105,7 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     xunji = xunji_snapshot(today)
     sync_status = "dry_run" if dry_run else "none"
     if not dry_run:
+        cache_xunji_nutrition_targets(xunji.get("diet", {}))
         try:
             sync_status = sync_mi_workouts(mi, today - timedelta(days=1))
         except Exception as exc:
@@ -2019,16 +2121,60 @@ def run_daily(force: bool = False, dry_run: bool = False) -> int:
     advice = model_advice(config, mi, xunji, context=lines)
     lines.append("教练建议：" + advice)
     progress = daily_progress(mi_cache_overview(today - timedelta(days=1)), today - timedelta(days=1))
+    resend_date = today if daily_needs_resend(lines) else None
     title = f"健身日报 · {today.month}月{today.day}日"
     if dry_run:
         preview_report(title, lines, progress)
         return 0
-    if not send_report(config, title, lines, request_id("daily", today.isoformat(), lines), progress):
+    if not send_report(config, title, lines, request_id("daily", today.isoformat(), lines), progress, resend_date=resend_date):
         return 2
     meta_set("last_daily", today.isoformat())
     if body_change:
         meta_set("last_body_measurement", body_change["timestamp"])
     return 0
+
+
+def card_action(entry: dict[str, Any], chat_id: str, not_before: datetime) -> tuple[str, str] | None:
+    if entry.get("phase") != "cardAction" or entry.get("event") != "cmd" or entry.get("scope") != chat_id:
+        return None
+    match = re.fullmatch(r"bodycoach\.resend\.(\d{8})", str(entry.get("cmd", "")))
+    if not match:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(str(entry.get("ts", "")).replace("Z", "+00:00"))
+        if timestamp.tzinfo:
+            timestamp = timestamp.astimezone()
+        if timestamp < not_before or datetime.strptime(match.group(1), "%Y%m%d").date() != date.today():
+            return None
+    except (TypeError, ValueError):
+        return None
+    return match.group(1), f"{entry.get('ts')}|{entry.get('msgId')}|{entry.get('cmd')}"
+
+
+def run_card_actions(watch: bool = False) -> int:
+    ensure_lark_channel_env()
+    config = load_config()
+    log_dir = Path(os.environ["LARK_CHANNEL_HOME"]) / "profiles" / os.environ["LARK_CHANNEL_PROFILE"] / "logs"
+    started = datetime.now().astimezone()
+    while True:
+        latest: tuple[datetime, str] | None = None
+        for path in log_dir.glob("bridge-*.jsonl"):
+            if path.stat().st_mtime < time.time() - 86400:
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                    action = card_action(entry, config["chat_id"], started)
+                    if action:
+                        timestamp = datetime.fromisoformat(str(entry["ts"]).replace("Z", "+00:00"))
+                        latest = max(latest or (timestamp, action[1]), (timestamp, action[1]))
+                except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+        if latest and meta_get("last_card_action") != latest[1] and run_daily(force=True) == 0:
+            meta_set("last_card_action", latest[1])
+        if not watch:
+            return 0
+        time.sleep(3)
 
 
 def run_weekly(dry_run: bool = False) -> int:
@@ -2041,6 +2187,8 @@ def run_weekly(dry_run: bool = False) -> int:
         period_start = period_end - timedelta(days=6)
         mi = mi_snapshot(config, 13, period_end)
         xunji = xunji_snapshot(period_end, weekly=True)
+        if not dry_run:
+            cache_xunji_nutrition_targets(xunji.get("diet", {}))
         title = f"健身周报 · {period_start.month}月{period_start.day}日—{period_end.month}月{period_end.day}日"
         facts = weekly_summary(mi, xunji, period_start, period_end)
         next_plan = next_week_training_plan(mi, xunji, period_end + timedelta(days=1))
@@ -2104,10 +2252,11 @@ def write_food(path: Path, source_id: str) -> int:
         conn.execute("insert or replace into writes(request_id,status,response) values(?,?,?)", (rid, "ok", json.dumps(compact_data(result), ensure_ascii=False)))
     day = date.fromisoformat(foods[0].get("date", date.today().isoformat()))
     try:
-        diet = post_json("https://eatings.xunjiapp.cn/open/food/query_gzip", {"start_date": (day - timedelta(days=6)).isoformat(), "end_date": day.isoformat(), "include_detail": True}, "xunji_diet_key")
+        diet = post_json("https://eatings.xunjiapp.cn/open/food/query_gzip", xunji_food_query_payload(day), "xunji_diet_key")
     except Exception:
         written_day = result.get("res", {}).get("day", {})
         diet = {"res": {"days": [written_day] if written_day else []}}
+    cache_xunji_nutrition_targets(diet)
     print(json.dumps({"request_id": rid, "written": len(foods), "feedback": meal_feedback(diet, day, foods)}, ensure_ascii=False))
     return 0
 
@@ -2259,13 +2408,56 @@ def self_check(data_dir: Path) -> int:
         pass
     staged_sleep = {
         "duration_minutes": 498,
-        "time_asleep_minutes": 498,
-        "time_awake_minutes": 0,
+        "time_asleep_minutes": 373,
+        "time_awake_minutes": 125,
         "stages": json.dumps([{"stage": "light", "minutes": 373}, {"stage": "awake", "minutes": 125}]),
     }
     assert sleep_asleep_minutes(staged_sleep) == 373
+    conflicting_sleep = {
+        "duration_minutes": 466,
+        "time_asleep_minutes": 465,
+        "time_awake_minutes": 1,
+        "stages": json.dumps([{"stage": "light", "minutes": 369}, {"stage": "awake", "minutes": 98}]),
+    }
+    assert sleep_asleep_minutes(conflicting_sleep) == 465
     assert sleep_asleep_minutes({"duration_minutes": 464, "time_asleep_minutes": 464, "stages": '[{"stage":"light","minutes":464}]'}) == 464
+    with sqlite3.connect(":memory:") as sleep_conn:
+        sleep_conn.row_factory = sqlite3.Row
+        sleep_conn.execute(
+            "create table sleep_sessions (start_at text,end_at text,duration_minutes integer,time_asleep_minutes integer,time_awake_minutes integer,sleep_score integer,is_nap integer,stages text)"
+        )
+        sleep_conn.execute(
+            "insert into sleep_sessions values (?,?,?,?,?,?,?,?)",
+            ("2026-10-16T00:58:00+08:00", "2026-10-17T09:05:00+08:00", 487, 487, 0, None, 0, "[]"),
+        )
+        assert _sleep_session(sleep_conn, date(2026, 10, 17)) is None
+        sleep_conn.execute(
+            "insert into sleep_sessions values (?,?,?,?,?,?,?,?)",
+            ("2026-10-18T00:30:00+08:00", "2026-10-18T08:30:00+08:00", 480, 480, 0, None, 0, "[]"),
+        )
+        assert _sleep_session(sleep_conn, date(2026, 10, 17))["end_at"].startswith("2026-10-18")
+    partial_day = {
+        "activity": {"date": "2026-10-17", "steps": 54},
+        "sleep": {"end_at": "2026-10-17T09:05:00+08:00", "time_asleep_minutes": 487},
+        "heart": {"date": "2026-10-17", "min_bpm": 56, "max_bpm": 88, "resting_bpm": 64, "last_sample": "2026-10-17T09:40:00+08:00"},
+    }
+    assert mi_day_incomplete(partial_day, date(2026, 10, 17))
+    assert not mi_day_incomplete({"heart": {"last_sample": "2026-10-17T23:40:00+08:00"}}, date(2026, 10, 17))
+    partial_progress = daily_progress(partial_day, date(2026, 10, 17))
+    assert all(item["progress"] == 0 for item in partial_progress)
     assert "subtitle" not in report_card("健身日报 · 10月11日", [])["header"]
+    resend_card = report_card("健身日报", ["睡眠数据缺失"], resend_date=date(2026, 10, 18))
+    assert resend_card["body"]["elements"][-1]["behaviors"][0]["value"]["cmd"] == "bodycoach.resend.20261018"
+    assert daily_needs_resend(["小米数据：昨日活动与心率不完整"])
+    assert daily_needs_resend(["睡眠数据缺失：同步后重发"])
+    assert not daily_needs_resend(["睡眠：7小时", "静息心率：62 bpm"])
+    assert not daily_report_allowed(datetime(2026, 10, 22, 1, 30))
+    assert daily_report_allowed(datetime(2026, 10, 22, 9, 30))
+    assert daily_report_allowed(datetime(2026, 10, 22, 1, 30), force=True)
+    now = datetime.now().astimezone()
+    action_entry = {"phase": "cardAction", "event": "cmd", "scope": "chat-test", "cmd": f"bodycoach.resend.{date.today():%Y%m%d}", "ts": now.isoformat(), "msgId": "m1"}
+    assert card_action(action_entry, "chat-test", now - timedelta(seconds=1))[0] == f"{date.today():%Y%m%d}"
+    assert card_action(action_entry, "other-chat", now - timedelta(seconds=1)) is None
     daily_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["已校验汇总"])
     trained_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, context=["昨日运动：户外骑行 60分钟", "昨日完成：无训练记录"])
     weekly_prompt = advice_prompt({"raw": "mi"}, {"raw": "xunji"}, weekly=True, context=["趋势汇总"])
@@ -2314,13 +2506,32 @@ def self_check(data_dir: Path) -> int:
             else:
                 conn.execute("insert or replace into meta(key,value) values('last_model_error',?)", (original_model_error,))
     print("self-check: model-diagnostic ok")
+    model_attempts = [0]
+
+    def retrying_model(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        model_attempts[0] += 1
+        if model_attempts[0] == 1:
+            raise subprocess.TimeoutExpired(command, MODEL_ANALYSIS_TIMEOUT_SECONDS)
+        model_output = Path(command[command.index("-o") + 1])
+        model_output.write_text("第二次成功", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with patch(__name__ + ".run_process", side_effect=retrying_model), patch(__name__ + ".meta_set") as saved_meta:
+        advice = model_advice(
+            {"model_analysis": True, "codex_cli": sys.executable}, {}, {},
+            context=["昨日运动：力量训练 60分钟"],
+        )
+    assert advice == "第二次成功" and model_attempts[0] == MODEL_ANALYSIS_ATTEMPTS
+    saved_meta.assert_called_once_with("last_model_error", "")
+    print("self-check: model-retry ok")
     fake_cache = {"activity": {}, "sleep": {}, "heart": {}, "body": {}}
+    assert xunji_food_query_payload(date(2026, 10, 19))["start_date"] == "2026-07-21"
     diet_with_prior_target = {
         "res": {
             "days": [
                 {"date": "2026-10-09", "foods": {"limits": {"protein": 162, "carb": 216, "fat": 72}}},
                 {
-                    "date": "2026-10-10",
+                    "date": "2026-10-19",
                     "totals": {"totalCal": 1437.315, "totalProtein": 71.424, "totalCarb": 154.866, "totalFat": 59.287},
                     "foods": {"limits": {"protein": 0, "carb": 0, "fat": 0}},
                 },
@@ -2328,9 +2539,14 @@ def self_check(data_dir: Path) -> int:
         }
     }
     with patch(__name__ + ".mi_cache_overview", return_value=fake_cache):
-        nutrition = local_summary({"status": "ok"}, {"training": [], "diet": diet_with_prior_target}, date(2026, 10, 11))
+        nutrition = local_summary({"status": "ok"}, {"training": [], "diet": diet_with_prior_target}, date(2026, 10, 20))
     assert "饮食热量：1437 / 2160 kcal" in nutrition
     assert "蛋白质：71 / 162 g" in nutrition
+    with patch(__name__ + ".meta_get", return_value=json.dumps({"calories": 2160, "protein": 162, "carbs": 216, "fat": 72})):
+        assert xunji_nutrition_targets({})["protein"] == 162
+    with patch(__name__ + ".meta_set") as target_cache:
+        assert cache_xunji_nutrition_targets(diet_with_prior_target)["calories"] == 2160
+        target_cache.assert_called_once()
     print("self-check: nutrition-target-fallback ok")
     fake_xunji = {"training": [], "diet": {}, "body": {}}
     fake_config = {"model_analysis": False, "codex_cli": "missing", "chat_id": "chat-test", "lark_cli": "lark-cli"}
@@ -2367,6 +2583,8 @@ def main() -> int:
     weekly.add_argument("--dry-run", action="store_true")
     meal = sub.add_parser("meal-reminder")
     meal.add_argument("--dry-run", action="store_true")
+    actions = sub.add_parser("card-actions")
+    actions.add_argument("--watch", action="store_true")
     food = sub.add_parser("food")
     food.add_argument("--json-file", type=Path, required=True)
     food.add_argument("--source-id", required=True)
@@ -2444,6 +2662,8 @@ def main() -> int:
         return run_weekly(args.dry_run)
     if args.command == "meal-reminder":
         return run_meal_reminder(args.dry_run)
+    if args.command == "card-actions":
+        return run_card_actions(args.watch)
     if args.command == "food":
         return write_food(args.json_file, args.source_id)
     if args.command == "set-secret":

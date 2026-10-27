@@ -48,6 +48,7 @@ $dataArgument = if ($useDefaultData) { '' } else { " --data-dir `"$data`"" }
 $dailyArguments = "`"$coach`"$dataArgument daily"
 $weeklyArguments = "`"$coach`"$dataArgument weekly"
 $mealArguments = "`"$coach`"$dataArgument meal-reminder"
+$cardActionArguments = "`"$coach`"$dataArgument card-actions --watch"
 $coachArguments = @($coach)
 if (-not $useDefaultData) {
     $coachArguments += @('--data-dir', $data)
@@ -79,9 +80,10 @@ if ($WhatIfPreference) {
         [void]$PSCmdlet.ShouldProcess($archive, "Archive $legacy excluding .venv, verify it, then migrate")
     }
     [void]$PSCmdlet.ShouldProcess($skillTarget, "Create junction to $skillSource")
-    [void]$PSCmdlet.ShouldProcess('BodyCoach-DailyReport', "Register pythonw.exe $dailyArguments (AtLogOn + PT3M)")
+    [void]$PSCmdlet.ShouldProcess('BodyCoach-DailyReport', "Register pythonw.exe $dailyArguments (Daily 09:30, StartWhenAvailable)")
     [void]$PSCmdlet.ShouldProcess('BodyCoach-WeeklyReport', "Register pythonw.exe $weeklyArguments (Sunday 23:00, StartWhenAvailable)")
     [void]$PSCmdlet.ShouldProcess('BodyCoach-MealReminder', "Register pythonw.exe $mealArguments (Daily 23:30)")
+    [void]$PSCmdlet.ShouldProcess('BodyCoach-CardActions', "Register pythonw.exe $cardActionArguments (AtLogOn + PT1M)")
     return
 }
 
@@ -155,9 +157,9 @@ Invoke-Checked $python ($coachArguments + @('doctor'))
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
 $dailyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $dailyArguments
-$dailyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$dailyTrigger.Delay = 'PT3M'
-Register-ScheduledTask -TaskName 'BodyCoach-DailyReport' -Action $dailyAction -Trigger $dailyTrigger -Settings $settings -Principal $principal -Description 'Send the daily private fitness report after logon' -Force | Out-Null
+$dailyTrigger = New-ScheduledTaskTrigger -Daily -At '09:30'
+$dailySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+Register-ScheduledTask -TaskName 'BodyCoach-DailyReport' -Action $dailyAction -Trigger $dailyTrigger -Settings $dailySettings -Principal $principal -Description 'Send the daily private fitness report at 09:30 or after a missed start' -Force | Out-Null
 
 $weeklyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $weeklyArguments
 $weeklyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '23:00'
@@ -166,5 +168,11 @@ Register-ScheduledTask -TaskName 'BodyCoach-WeeklyReport' -Action $weeklyAction 
 $mealAction = New-ScheduledTaskAction -Execute $pythonw -Argument $mealArguments
 $mealTrigger = New-ScheduledTaskTrigger -Daily -At '23:30'
 Register-ScheduledTask -TaskName 'BodyCoach-MealReminder' -Action $mealAction -Trigger $mealTrigger -Settings $settings -Principal $principal -Description 'Remind when a meal record is missing' -Force | Out-Null
+
+$cardActionSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$cardAction = New-ScheduledTaskAction -Execute $pythonw -Argument $cardActionArguments
+$cardActionTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$cardActionTrigger.Delay = 'PT1M'
+Register-ScheduledTask -TaskName 'BodyCoach-CardActions' -Action $cardAction -Trigger $cardActionTrigger -Settings $cardActionSettings -Principal $principal -Description 'Handle fitness report card actions from the local Lark bridge' -Force | Out-Null
 
 Write-Host "Installed body-fitness-coach with private data at $data"
