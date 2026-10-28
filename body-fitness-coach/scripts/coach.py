@@ -150,6 +150,9 @@ def normalize_food_meal_types(foods: list[dict[str, Any]]) -> list[dict[str, Any
         "breakfast": {"breakfast", "morning", "早餐"},
         "lunch": {"lunch", "noon", "midday", "午餐"},
         "dinner": {"dinner", "night", "evening", "晚餐"},
+        "morning-added": {"morning-added", "上午加餐"},
+        "noon-added": {"noon-added", "下午加餐"},
+        "night-added": {"night-added", "晚间加餐", "夜宵"},
     }
     for food in foods:
         value = str(food.get("meal_type", "")).strip().lower()
@@ -1372,9 +1375,9 @@ def workout_brief(mi: dict[str, Any], day: date, free_label: str = "自由活动
         if not isinstance(workout, dict) or _record_date(workout.get("start_at")) != day:
             continue
         activity_type = workout.get("activity_type")
-        if activity_type not in MI_CARDIO and activity_type != "free_training":
+        if activity_type not in MI_CARDIO and activity_type not in ("free_training", "strength_training"):
             continue
-        label = MI_CARDIO[activity_type][2] if activity_type in MI_CARDIO else free_label
+        label = MI_CARDIO[activity_type][2] if activity_type in MI_CARDIO else ("力量训练" if activity_type == "strength_training" else free_label)
         details = []
         if isinstance(workout.get("duration_minutes"), (int, float)):
             details.append(f"{workout['duration_minutes']:.0f}分钟")
@@ -2067,13 +2070,15 @@ def model_advice(config: dict[str, Any], mi: dict[str, Any], xunji: dict[str, An
     return "模型分析暂不可用（运行 doctor 查看原因）；" + fallback
 
 
-def send_report(config: dict[str, Any], title: str, lines: list[str], identity: str, progress: list[dict[str, Any]] | None = None, subtitle: str | None = None, resend_date: date | None = None) -> bool:
+def send_report(config: dict[str, Any], title: str, lines: list[str], identity: str, progress: list[dict[str, Any]] | None = None, subtitle: str | None = None, resend_date: date | None = None, card_override: dict[str, Any] | None = None) -> bool:
     ensure_lark_channel_env()
-    card = json.dumps(report_card(title, lines, daily_progress=progress, subtitle=subtitle, resend_date=resend_date), ensure_ascii=False, separators=(",", ":"))
+    card = json.dumps(card_override if card_override is not None else report_card(title, lines, daily_progress=progress, subtitle=subtitle, resend_date=resend_date), ensure_ascii=False, separators=(",", ":"))
     base = command_prefix(config["lark_cli"]) + ["im", "+messages-send", "--as", "bot", "--chat-id", config["chat_id"], "--idempotency-key", identity]
     sent = run_process(base + ["--msg-type", "interactive", "--content", card], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if sent.returncode == 0:
         return True
+    if card_override is not None:
+        return False  # A text fallback is not a working meal form.
     text = title + "\n" + "\n".join(f"- {line}" for line in lines)
     fallback = run_process(base + ["--text", text], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     return fallback.returncode == 0
@@ -2211,25 +2216,31 @@ def run_weekly(dry_run: bool = False) -> int:
     return 0
 
 
-def run_meal_reminder(dry_run: bool = False) -> int:
+def run_meal_reminder(dry_run: bool = False, force: bool = False) -> int:
     config = load_config()
     today = date.today()
     try:
         diet = post_json(
             "https://eatings.xunjiapp.cn/open/food/query_gzip",
-            {"start_date": today.isoformat(), "end_date": today.isoformat(), "include_detail": True},
+            {"start_date": (today - timedelta(days=30)).isoformat(), "end_date": today.isoformat(), "include_detail": True},
             "xunji_diet_key",
         )
     except Exception:
         return 2
     missing = missing_meals(diet, today)
-    if not missing:
+    if not missing and not force:
         return 0
     lines = [f"未记录：{'、'.join(missing)}", "如已用餐，请把食物和大致份量发给我；未用餐可忽略。"]
+    form_card = None
+    if config.get("meal_owner_id"):
+        from meal_forms import build_form
+        form_card, _ = build_form(config, diet, today, persist=not dry_run)
     if dry_run:
         preview_report("三餐记录提醒", lines)
+        if form_card:
+            print(json.dumps(form_card, ensure_ascii=False, indent=2))
         return 0
-    return 0 if send_report(config, "三餐记录提醒", lines, request_id("meal", today.isoformat(), missing), subtitle=today.isoformat()) else 2
+    return 0 if send_report(config, "三餐记录提醒", lines, request_id("meal", today.isoformat(), form_card or missing), subtitle=today.isoformat(), card_override=form_card) else 2
 
 
 def write_food(path: Path, source_id: str) -> int:
@@ -2486,6 +2497,8 @@ def self_check(data_dir: Path) -> int:
     assert "力量训练" in recommendation and "×" not in recommendation and "组" not in recommendation
     assert "周末游泳与BODY PUMP" in plan and "动作从模板库选择" in plan and "轮到" not in plan
     assert "户外骑行 60分钟" in workout_brief(fake_mi, date(2026, 10, 6))
+    strength_mi = {"data": {"query_workouts": {"data": {"workouts": [{"activity_type": "strength_training", "start_at": "2020-01-02T18:00:00+08:00", "duration_minutes": 40, "calories_kcal": 250, "avg_heart_rate_bpm": 110, "max_heart_rate_bpm": 145}]}}}}
+    assert workout_brief(strength_mi, date(2020, 1, 2)) == "力量训练 40分钟 · 250kcal · 心率110/145"
     assert mi_workouts_for_day(fake_mi, date(2026, 10, 6))[0]["activity_type"] == "outdoor_riding"
     analysis, decision = split_weekly_advice("恢复：稳定。模板判断：保持当前模板；证据不足。")
     assert analysis == "恢复：稳定。" and decision.startswith("保持现有模板库")
@@ -2583,6 +2596,7 @@ def main() -> int:
     weekly.add_argument("--dry-run", action="store_true")
     meal = sub.add_parser("meal-reminder")
     meal.add_argument("--dry-run", action="store_true")
+    meal.add_argument("--force", action="store_true", help="Send a card for additional food even when all three meals are recorded")
     actions = sub.add_parser("card-actions")
     actions.add_argument("--watch", action="store_true")
     food = sub.add_parser("food")
@@ -2661,7 +2675,7 @@ def main() -> int:
     if args.command == "weekly":
         return run_weekly(args.dry_run)
     if args.command == "meal-reminder":
-        return run_meal_reminder(args.dry_run)
+        return run_meal_reminder(args.dry_run, args.force)
     if args.command == "card-actions":
         return run_card_actions(args.watch)
     if args.command == "food":

@@ -41,7 +41,9 @@ Skill 会先检查：
 ## 文件职责
 
 - `SKILL.md`：新会话的操作规则、授权边界和报告要求。
-- `scripts/coach.py`：唯一业务入口，处理数据、餐食、训练、日报、周报、提醒、诊断和轻量自检。
+- `scripts/coach.py`：命令入口，处理数据、餐食、训练、日报、周报、提醒、诊断和轻量自检。
+- `scripts/meal_forms.py`、`bridge_meals.mjs`：三餐及加餐表单、原生 bridge 回调、营养回执与重复提交保护。
+- `scripts/install_meal_bridge.py`：预览或安装原生表单命令入口，原始 bridge 文件备份到 `.private/`；不修改回调签名校验。
 - `scripts/install.ps1`：唯一安装维护入口，建立私有环境、注册 Skill 和 Windows 计划任务。
 - `.gitignore`：排除整个 `.private/`、Python 缓存和字节码。
 
@@ -63,11 +65,36 @@ powershell -File .\scripts\install.ps1 -WhatIf
 
 安装器默认使用当前 Skill 的 `.private/`，并注册：
 
-- `BodyCoach-DailyReport`：登录后生成日报。
+- `BodyCoach-DailyReport`：每天 09:30 生成日报；错过后按计划任务补跑。
 - `BodyCoach-WeeklyReport`：每周日 23:00 生成周报；关机错过后在下次登录时按周从旧到新补发，每张成功后保存进度。
 - `BodyCoach-MealReminder`：每天 23:30 检查缺失餐食。
 
 任务直接运行 `.private/.venv/Scripts/pythonw.exe`，不依赖聊天会话，也不弹 PowerShell 窗口。
+
+## 三餐与加餐卡片
+
+每餐显示过去 30 天频率最高的前五个组合，同频时优先近期记录；生成新卡时重新计算，旧卡保持原有选项。组合显示全部食物，早餐按主食、牛奶、茶叶蛋排序。日期放在标题，正文不显示额外说明或份量展开区。
+
+底部“其他”可多选蛋白粉 35g（水冲）、牛奶 260ml（一杯），营养值取自历史记录；也可输入零食、夜宵等自定义内容。自定义内容优先于所选组合，留空跳过。加餐按提交时间归入上午、下午或晚间加餐，三餐不被覆盖。一次成功提交后会返回营养统计，重复点击不重复记录；再次加餐可请求新卡。
+
+统计排序、生成卡片、选择已有组合均不调用模型；解析自定义食物时才调用模型。个人数据、选项快照和记账状态仅保存在 `.private/`。
+
+首次配置记录人（用户 ID 仅写入本地私有库）：
+
+```powershell
+.private/.venv/Scripts/python.exe scripts/install_meal_bridge.py
+.private/.venv/Scripts/python.exe scripts/install_meal_bridge.py --apply --owner-id <user-open-id>
+```
+
+安装后重启 bridge。升级 bridge 软件包后重新运行上述安装器恢复命令入口。需要在当前 bridge 会话结束后自动启用时，可使用 `scripts/schedule_meal_activation.ps1`，具体约束见 `SKILL.md`。
+
+```powershell
+# 预览不发送；即使三餐均已记录，也可主动发送加餐卡。
+.private/.venv/Scripts/python.exe scripts/coach.py meal-reminder --dry-run
+.private/.venv/Scripts/python.exe scripts/coach.py meal-reminder --force
+.private/.venv/Scripts/python.exe scripts/test_meal_forms.py
+node scripts/test_bridge_meals.mjs
+```
 
 ## 常用命令
 

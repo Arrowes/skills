@@ -80,6 +80,7 @@ if ($WhatIfPreference) {
         [void]$PSCmdlet.ShouldProcess($archive, "Archive $legacy excluding .venv, verify it, then migrate")
     }
     [void]$PSCmdlet.ShouldProcess($skillTarget, "Create junction to $skillSource")
+    [void]$PSCmdlet.ShouldProcess('lark-channel-bridge', 'Install skill-owned native meal command hook (bridge restart required)')
     [void]$PSCmdlet.ShouldProcess('BodyCoach-DailyReport', "Register pythonw.exe $dailyArguments (Daily 09:30, StartWhenAvailable)")
     [void]$PSCmdlet.ShouldProcess('BodyCoach-WeeklyReport', "Register pythonw.exe $weeklyArguments (Sunday 23:00, StartWhenAvailable)")
     [void]$PSCmdlet.ShouldProcess('BodyCoach-MealReminder', "Register pythonw.exe $mealArguments (Daily 23:30)")
@@ -152,12 +153,14 @@ if ($useDefaultData) {
 $env:LARK_CHANNEL_PROFILE = $Profile
 
 Invoke-Checked $python ($coachArguments + @('self-check'))
+Invoke-Checked $python @((Join-Path $skillSource 'scripts\install_meal_bridge.py'), '--apply')
 Invoke-Checked $python ($coachArguments + @('doctor'))
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
 $dailyAction = New-ScheduledTaskAction -Execute $pythonw -Argument $dailyArguments
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At '09:30'
+$dailyTrigger.EndBoundary = '2099-12-31T23:59:59'
 $dailySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
 Register-ScheduledTask -TaskName 'BodyCoach-DailyReport' -Action $dailyAction -Trigger $dailyTrigger -Settings $dailySettings -Principal $principal -Description 'Send the daily private fitness report at 09:30 or after a missed start' -Force | Out-Null
 
